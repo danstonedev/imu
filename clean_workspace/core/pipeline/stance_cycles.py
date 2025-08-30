@@ -8,11 +8,16 @@ from ..config.constants import (
 __all__ = ["composite_stance","contacts_from_stance","cycle_mean_sd"]
 
 def composite_stance(omega_W: np.ndarray, a_free_W: np.ndarray,
-                     th_w: float = STANCE_THR_W, th_a: float = STANCE_THR_A,
+                     th_w: float | None = STANCE_THR_W, th_a: float | None = STANCE_THR_A,
                      hyst: int = STANCE_HYST_SAMPLES) -> np.ndarray:
     wmag = np.linalg.norm(omega_W, axis=1)
     amag = np.linalg.norm(a_free_W, axis=1)
-    raw = (wmag < th_w) & (amag < th_a)
+    # Adaptive thresholds with MAD, respecting current defaults as minimums
+    mad_w = float(1.4826 * np.median(np.abs(wmag - np.median(wmag)))) if wmag.size else 0.0
+    mad_a = float(1.4826 * np.median(np.abs(amag - np.median(amag)))) if amag.size else 0.0
+    th_w_eff = float(max(STANCE_THR_W, 3.5 * mad_w)) if th_w is None else float(th_w)
+    th_a_eff = float(max(STANCE_THR_A, 3.0 * mad_a)) if th_a is None else float(th_a)
+    raw = (wmag < th_w_eff) & (amag < th_a_eff)
     out = raw.copy()
     off = 0
     for i in range(1, len(raw)):

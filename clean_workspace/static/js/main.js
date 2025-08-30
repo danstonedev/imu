@@ -804,6 +804,8 @@ function renderMetrics(results) {
     const fmt = (v, d=1) => (typeof v === 'number' && isFinite(v)) ? v.toFixed(d) : 'N/A';
     const fmtPct = v => (typeof v === 'number' && isFinite(v)) ? v.toFixed(1)+'%' : 'N/A';
     const fmtVec = v => (Array.isArray(v) ? `[${v.map(x => fmt(x,1)).join(', ')}]` : 'N/A');
+    const safe = (o,k,def='N/A') => (o && o[k] != null ? o[k] : def);
+    const deg = r => (typeof r === 'number' && isFinite(r) ? (r*180/Math.PI) : NaN);
 
     // Component arrays
     const comps = [
@@ -886,7 +888,72 @@ function renderMetrics(results) {
         </table>
     `;
 
-    el.innerHTML = `${overview}${counts}${peaksTbl}${baseTbl}`;
+    // Detector and acquisition meta
+    const meta = results?.meta || {};
+    const det = meta?.detector || {};
+    const params = det?.params || {};
+    const filtAdj = det?.filter_adjustments || {};
+    const fs = meta?.fs_est || {};
+    const stance = meta?.stance_thresholds_used || {};
+    const yawSrc = meta?.yaw_ref_source || 'unknown';
+    const yawDeg = deg(meta?.yaw_ref_rad);
+    const sr = meta?.still_resample || {};
+
+    const detParamsRows = Object.keys(params).map(k => `<tr><td>${k}</td><td>${String(params[k])}</td></tr>`).join('') || '<tr><td colspan="2">None</td></tr>';
+    const filtAdjRows = Object.keys(filtAdj).map(k => `<tr><td>${k}</td><td>${String(filtAdj[k])}</td></tr>`).join('') || '<tr><td colspan="2">None</td></tr>';
+    const fsRows = `
+        <tr><td>pelvis</td><td>${fmt(Number(fs.pelvis||NaN),1)} Hz</td></tr>
+        <tr><td>L_femur</td><td>${fmt(Number(fs.L_femur||NaN),1)} Hz</td></tr>
+        <tr><td>R_femur</td><td>${fmt(Number(fs.R_femur||NaN),1)} Hz</td></tr>
+    `;
+    const stanceRows = `
+        <tr><td>Left</td><td>${fmt(Number(stance?.L?.w_thr||NaN),2)} rad/s</td><td>${fmt(Number(stance?.L?.a_thr||NaN),2)} m/s²</td><td>${fmt(Number(stance?.L?.mad_w||NaN),2)}</td><td>${fmt(Number(stance?.L?.mad_a||NaN),2)}</td></tr>
+        <tr><td>Right</td><td>${fmt(Number(stance?.R?.w_thr||NaN),2)} rad/s</td><td>${fmt(Number(stance?.R?.a_thr||NaN),2)} m/s²</td><td>${fmt(Number(stance?.R?.mad_w||NaN),2)}</td><td>${fmt(Number(stance?.R?.mad_a||NaN),2)}</td></tr>
+    `;
+    const yawTbl = `
+        <table class="metrics-table">
+            <thead><tr><th colspan="2">Orientation & Preprocess</th></tr></thead>
+            <tbody>
+                <tr><td>Yaw reference source</td><td>${String(yawSrc)}</td></tr>
+                <tr><td>Yaw reference (deg)</td><td>${fmt(Number(yawDeg||NaN),1)}</td></tr>
+                <tr><td>Still resample</td><td>${safe(sr,'method','N/A')} (thr=${safe(sr,'threshold','N/A')}, close=${safe(sr,'close_radius_samples','N/A')} samp)</td></tr>
+            </tbody>
+        </table>
+    `;
+    const detTbl = `
+        <table class="metrics-table">
+            <thead><tr><th colspan="2">Detector</th></tr></thead>
+            <tbody>
+                <tr><td>Name</td><td>${String(det?.detector || 'unified_gait')}</td></tr>
+                <tr><td>Sampling frequency (detector)</td><td>${fmt(Number(det?.sampling_frequency||NaN),1)} Hz</td></tr>
+            </tbody>
+        </table>
+        <table class="metrics-table">
+            <thead><tr><th colspan="2">Detector Params</th></tr></thead>
+            <tbody>${detParamsRows}</tbody>
+        </table>
+        <table class="metrics-table">
+            <thead><tr><th colspan="2">Filter Adjustments</th></tr></thead>
+            <tbody>${filtAdjRows}</tbody>
+        </table>
+    `;
+    const fsTbl = `
+        <table class="metrics-table">
+            <thead><tr><th colspan="2">Sampling Frequencies (est.)</th></tr></thead>
+            <tbody>${fsRows}</tbody>
+        </table>
+    `;
+    const stanceTbl = `
+        <table class="metrics-table">
+            <thead>
+                <tr><th colspan="5">Adaptive Stance Thresholds</th></tr>
+                <tr><th>Side</th><th>ω thr</th><th>a thr</th><th>MAD ω</th><th>MAD a</th></tr>
+            </thead>
+            <tbody>${stanceRows}</tbody>
+        </table>
+    `;
+
+    el.innerHTML = `${overview}${yawTbl}${detTbl}${fsTbl}${stanceTbl}${counts}${peaksTbl}${baseTbl}`;
 }
 
 // Angles time-series overlay (hip/knee; flex/add/rot)

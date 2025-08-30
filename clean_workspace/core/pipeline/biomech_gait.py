@@ -1,6 +1,10 @@
 """
 Advanced biomechanical gait event detection for tibia IMU data.
 Based on heel strike impact signatures, toe-off gyroscopic patterns, and bilateral coordination.
+
+DEPRECATED: This module predates the unified detector in
+core.pipeline.unified_gait and is kept only for reference. Prefer using
+core.pipeline.unified_gait.detect_gait_cycles and related helpers.
 """
 from __future__ import annotations
 import numpy as np
@@ -8,6 +12,13 @@ from scipy import signal
 from scipy.signal import butter, sosfiltfilt, find_peaks
 from typing import Tuple
 from ..config.constants import CYCLE_N, CYCLE_DROP_FIRST, CYCLE_DROP_LAST, CYCLE_MIN_DUR_S, CYCLE_MAX_DUR_S
+import warnings
+
+warnings.warn(
+    "core.pipeline.biomech_gait is deprecated; use core.pipeline.unified_gait",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
 __all__ = ["detect_heel_strikes_biomech", "detect_hs_to_biomech", "bilateral_gait_cycles", "bilateral_gait_analysis", "cycle_mean_sd_biomech"]
 

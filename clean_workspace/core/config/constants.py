@@ -48,7 +48,17 @@ GYR = {
     "z": ["gyr_z","gyro_z","wz","omega_z","gyr__z_","rate_z"],
 }
 ACC = {
-    "x": ["freeacc_x","acc_free_x","ax_free","free_acc_x","acc_x_free","freeaccx"],
-    "y": ["freeacc_y","acc_free_y","ay_free","free_acc_y","acc_y_free","freeaccy"],
-    "z": ["freeacc_z","acc_free_z","az_free","free_acc_z","acc_z_free","freeaccz"],
+    "x": [
+        "freeacc_x","acc_free_x","ax_free","free_acc_x","acc_x_free","freeaccx",
+        # Fallbacks when only raw acceleration is present
+        "acc_x","ax","accx"
+    ],
+    "y": [
+        "freeacc_y","acc_free_y","ay_free","free_acc_y","acc_y_free","freeaccy",
+        "acc_y","ay","accy"
+    ],
+    "z": [
+        "freeacc_z","acc_free_z","az_free","free_acc_z","acc_z_free","freeaccz",
+        "acc_z","az","accz"
+    ],
 }

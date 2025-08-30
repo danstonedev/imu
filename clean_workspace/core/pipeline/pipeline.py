@@ -9,11 +9,52 @@ from ..math.kinematics import (
     jcs_hip_angles, jcs_knee_angles,
 )
 from ..math.inverse_dynamics import hip_inverse_dynamics, hip_jcs_from_R, resolve_in_jcs
+from ..math.conventions import enforce_lr_conventions
 from .io_utils import read_xsens_bytes, extract_kinematics
 from .calibration import detect_still, calibration_windows_secs, calibrate_bias_trimmed
 from .unified_gait import detect_gait_cycles, gait_cycle_analysis
 
-__all__ = ["run_pipeline_clean"]
+__all__ = ["run_pipeline_clean", "compute_yaw_reference"]
+
+def compute_yaw_reference(tP: np.ndarray, RP_raw: np.ndarray, stillP: np.ndarray, cal_windows: list[dict] | None) -> tuple[float, str]:
+    """
+    Compute a stable yaw reference using only the start still window when available,
+    else the end window, otherwise fall back to median over the provided still mask
+    (or global median if mask empty).
+
+    Returns (yaw_ref_rad, source_tag) where source_tag in {"start","end","global"}.
+    """
+    yawP = yaw_from_R(RP_raw)
+    # Prefer explicit calibration windows (seconds) labeled 'start' or 'end'
+    if cal_windows:
+        # Build helper to median yaw over a time window
+        def median_yaw_in_seconds(t0: float, t1: float) -> float | None:
+            if not np.isfinite(t0) or not np.isfinite(t1) or t1 <= t0:
+                return None
+            i0 = int(np.searchsorted(tP, float(t0), side='left'))
+            i1 = int(np.searchsorted(tP, float(t1), side='right'))
+            i0 = max(0, min(i0, len(yawP)))
+            i1 = max(i0+1, min(i1, len(yawP)))
+            return float(np.median(yawP[i0:i1])) if (i1 > i0) else None
+
+        # Extract start and end windows, if present
+        start_win = next((w for w in cal_windows if w.get('label') == 'start'), None)
+        end_win   = next((w for w in cal_windows if w.get('label') == 'end'), None)
+
+        if start_win is not None:
+            m = median_yaw_in_seconds(float(start_win['start_s']), float(start_win['end_s']))
+            if m is not None:
+                return m, "start"
+        if end_win is not None:
+            m = median_yaw_in_seconds(float(end_win['start_s']), float(end_win['end_s']))
+            if m is not None:
+                return m, "end"
+
+    # Fallbacks: median over detected pelvis-still mask, then global median
+    sel = np.asarray(stillP, dtype=bool) if stillP is not None else None
+    if sel is not None and sel.any():
+        return float(np.median(yawP[sel[:len(yawP)]])), "global"
+    return (float(np.median(yawP)) if len(yawP) else 0.0), "global"
 
 def run_pipeline_clean(data: dict, height_m: float, mass_kg: float, options: dict) -> dict:
     do_cal = bool(options.get('do_cal', True)) if isinstance(options, dict) else True
@@ -94,15 +135,66 @@ def run_pipeline_clean(data: dict, height_m: float, mass_kg: float, options: dic
     RLt_raw = quats_to_R_batch(qLt)
     RRt_raw = quats_to_R_batch(qRt)
 
-    # Choose a single pelvis-based yaw reference to preserve relative rotations between segments
+    # Choose a single pelvis-based yaw reference using only start (then end) still window
     if yaw_align_flag:
-        yawP = yaw_from_R(RP_raw)
-        sel = stillP.copy()
-        if not sel.any():
-            sel = np.ones_like(stillP, dtype=bool)
-        yaw_ref = float(np.median(yawP[sel[:len(yawP)]])) if len(yawP) else 0.0
+        yaw_ref, yaw_src = compute_yaw_reference(tP, RP_raw, stillP, cal_windows)
     else:
-        yaw_ref = 0.0
+        yaw_ref, yaw_src = 0.0, "global"
+
+    # ---------------------------------------------
+    # Global overlap trimming (apply before any resampling)
+    # Ensures all segments operate on a common time window to avoid edge extrapolation
+    # ---------------------------------------------
+    def _overlap_window(ts: list[np.ndarray]) -> tuple[float, float]:
+        t0s = [float(x[0]) for x in ts if x is not None and len(x) > 0]
+        t1s = [float(x[-1]) for x in ts if x is not None and len(x) > 0]
+        if not t0s or not t1s:
+            return 0.0, 0.0
+        return max(t0s), min(t1s)
+
+    def _trim_time_series(t: np.ndarray, *arrs: np.ndarray, start: float, end: float) -> tuple:
+        if t is None or len(t) == 0:
+            return (t, *arrs)
+        if end <= start:
+            return (t, *arrs)
+        # inclusive bounds
+        m = (t >= start) & (t <= end)
+        if not np.any(m):
+            return (t, *arrs)
+        idx = np.where(m)[0]
+        t2 = t[idx]
+        out = [t2]
+        for a in arrs:
+            if a is None:
+                out.append(a)
+            else:
+                out.append(a[idx])
+        return tuple(out)
+
+    ov_start, ov_end = _overlap_window([tP, tLf, tRf, tLt, tRt])
+    overlap_meta = {
+        'start_s': float(ov_start),
+        'end_s': float(ov_end),
+        'duration_s': float(max(0.0, ov_end - ov_start)),
+        'applied': bool(ov_end > ov_start)
+    }
+
+    if overlap_meta['applied']:
+        # Trim pelvis (and still mask to stay aligned)
+        # First, trim time and arrays, then trim stillP by the same mask
+        tP_old = tP
+        tP, qP, gP, aP = _trim_time_series(tP, qP, gP, aP, start=ov_start, end=ov_end)
+        # Map stillP from old indexing to new by slicing with mask
+        if stillP is not None and len(tP_old) == len(stillP):
+            mP = (tP_old >= ov_start) & (tP_old <= ov_end)
+            stillP = stillP[mP]
+
+        # Left femur/tibia
+        tLf, qLf, gLf, aLf = _trim_time_series(tLf, qLf, gLf, aLf, start=ov_start, end=ov_end)
+        tLt, qLt, gLt, aLt = _trim_time_series(tLt, qLt, gLt, aLt, start=ov_start, end=ov_end)
+        # Right femur/tibia
+        tRf, qRf, gRf, aRf = _trim_time_series(tRf, qRf, gRf, aRf, start=ov_start, end=ov_end)
+        tRt, qRt, gRt, aRt = _trim_time_series(tRt, qRt, gRt, aRt, start=ov_start, end=ov_end)
 
     def resample_side(tF, qF, gF, aF, tT, qT, gT, aT, tP, qP):
         tF = tF - tF[0]; tT = tT - tT[0]; tP = tP - tP[0]
@@ -161,9 +253,25 @@ def run_pipeline_clean(data: dict, height_m: float, mass_kg: float, options: dic
     aRt_res = moving_avg(aRt_res, win=7)
 
     omegaL_shank_W = world_vec(RLt, gLt_res)
-    aL_free_W = world_vec(RLt, aLt_res)
+    aL_W = world_vec(RLt, aLt_res)
     omegaR_shank_W = world_vec(RRt, gRt_res)
-    aR_free_W = world_vec(RRt, aRt_res)
+    aR_W = world_vec(RRt, aRt_res)
+
+    # If inputs lacked explicit freeacc_*, a_* may include gravity. Auto-correct in world frame.
+    from ..config.constants import G as G_W
+    def gravity_correct_if_needed(aW: np.ndarray) -> tuple[np.ndarray, dict]:
+        if aW is None or len(aW) == 0:
+            return aW, {'applied': False}
+        # Check median vertical component against expected gravity
+        z_med = float(np.median(aW[:, 2]))
+        gz = float(G_W[2])  # typically -9.80665
+        # If close to gravity (within ~2 m/s^2), assume raw and subtract G
+        if np.isfinite(z_med) and abs(z_med - gz) < 2.0:
+            return (aW - G_W).astype(np.float32), {'applied': True, 'z_median_before': z_med}
+        return aW.astype(np.float32), {'applied': False, 'z_median_before': z_med}
+
+    aL_free_W, acc_corr_L = gravity_correct_if_needed(aL_W)
+    aR_free_W, acc_corr_R = gravity_correct_if_needed(aR_W)
 
     # Unified biomechanical gait cycle detection
     gait_results = detect_gait_cycles(
@@ -188,19 +296,12 @@ def run_pipeline_clean(data: dict, height_m: float, mass_kg: float, options: dic
     MhipL_J = resolve_in_jcs(MhipL_W, RJL)
     MhipR_J = resolve_in_jcs(MhipR_W, RJR)
 
-    # Normalize signs for Right side so that Mx, Mz are comparable to Left (mirror about sagittal/transverse): invert x and z
-    MhipR_J = MhipR_J.copy()
-    if MhipR_J.shape[1] >= 3:
-        MhipR_J[:, 0] *= -1.0  # mirror Right X to match Left X
-        MhipR_J[:, 2] *= -1.0  # mirror Right Z to match Left Z
-
-    # Clinical convention: hip flexion torque should be positive.
-    # If current JCS resolution yields flexion as negative on Left, flip Mx for BOTH sides
-    # after mirroring so they remain comparable and flexion is positive.
-    if MhipL_J.shape[1] >= 3:
-        MhipL_J[:, 0] *= -1.0
-    if MhipR_J.shape[1] >= 3:
-        MhipR_J[:, 0] *= -1.0
+    # Centralize sign conventions for moments and angles
+    anglesL_dict = {'hip': hipL_deg, 'knee': kneeL_deg}
+    anglesR_dict = {'hip': hipR_deg, 'knee': kneeR_deg}
+    MhipL_J, MhipR_J, outL_angles, outR_angles = enforce_lr_conventions(MhipL_J, MhipR_J, anglesL_dict, anglesR_dict)
+    hipL_deg, kneeL_deg = outL_angles['hip'], outL_angles['knee']
+    hipR_deg, kneeR_deg = outR_angles['hip'], outR_angles['knee']
 
     # Baseline subtraction using still windows (median per component).
     # IMPORTANT: Align pelvis-based still windows to each limb's time origin.
@@ -216,7 +317,15 @@ def run_pipeline_clean(data: dict, height_m: float, mass_kg: float, options: dic
             return np.zeros_like(t_side, dtype=bool)
         # Map limb-local time (since its own start) to pelvis-local time by adding delta
         s = np.interp(t_side + delta, tP0, stillP_f, left=stillP_f[0], right=stillP_f[-1])
-        return s > 0.5
+        # Conservative threshold and morphological closing (1-2 samples) to avoid pinholes
+        thr = 0.75
+        m = s >= thr
+        if m.size >= 3:
+            # close 1-sample holes: True False True -> True True True
+            holes = (~m[1:-1]) & (m[:-2] & m[2:])
+            if np.any(holes):
+                m[1:-1][holes] = True
+        return m
 
     maskL = resample_still(tL, deltaL)
     maskR = resample_still(tR, deltaR)
@@ -332,11 +441,7 @@ def run_pipeline_clean(data: dict, height_m: float, mass_kg: float, options: dic
     kneeL_deg, kneeL_b0, kneeL_b1 = subtract_angle_baseline(kneeL_deg, tL, maskL)
     kneeR_deg, kneeR_b0, kneeR_b1 = subtract_angle_baseline(kneeR_deg, tR, maskR)
 
-    # Enforce flexion-positive convention (flip flex/ext if needed)
-    # Column order: [flex, add, rot]
-    for A in (hipL_deg, hipR_deg, kneeL_deg, kneeR_deg):
-        if A is not None and A.shape[1] >= 1:
-            A[:, 0] *= -1.0
+    # Angle flexion sign already enforced by enforce_lr_conventions
 
     def resample_mean_sd(arr, n=101):
         if len(arr) < 2:
@@ -424,6 +529,19 @@ def run_pipeline_clean(data: dict, height_m: float, mass_kg: float, options: dic
 
     stance_L = create_stance_array_from_times(tL, hsL_times, toL_times)
     stance_R = create_stance_array_from_times(tR, hsR_times, toR_times)
+
+    # Estimate sampling frequencies for meta
+    def _fs_est(t: np.ndarray) -> float:
+        if t is None or len(t) < 2:
+            return float('nan')
+        dt = np.diff(t)
+        dt = dt[np.isfinite(dt) & (dt > 0)]
+        return float(1.0 / np.median(dt)) if dt.size else float('nan')
+    fs_meta = {
+        'pelvis': _fs_est(tP),
+        'L_femur': _fs_est(tL), 'R_femur': _fs_est(tR),
+        'L_tibia': _fs_est(tL), 'R_tibia': _fs_est(tR),
+    }
     
     def cycle_mean_sd(t, sig, contacts, toe_offs):
         """Mean and standard deviation for each gait cycle with adaptive edge-drop."""
@@ -797,8 +915,71 @@ def run_pipeline_clean(data: dict, height_m: float, mass_kg: float, options: dic
     left_knee_cycle_csv = build_angle_cycle_csv('L', 'knee')
     right_knee_cycle_csv = build_angle_cycle_csv('R', 'knee')
 
+    # CSVs for anchored comparison (what the matrix view displays)
+    def build_compare_csv(cmp: dict) -> str:
+        def arr(path: list[str]):
+            d = cmp
+            for p in path:
+                d = d.get(p, {})
+            a = np.asarray(d if isinstance(d, (list, np.ndarray)) else d, dtype=np.float32)
+            return a
+        # Determine length from Mx L mean
+        Lmx_m = np.asarray(cmp.get('Mx', {}).get('L', {}).get('mean', np.zeros(101, np.float32)), dtype=np.float32)
+        n = int(Lmx_m.shape[0]) if Lmx_m.ndim == 1 else int(Lmx_m.shape[0])
+        phase = np.linspace(0, 100, n, dtype=np.float32)
+        header = (
+            "phase_pct," \
+            "L_Mx_mean(Nm),L_Mx_sd(Nm),L_My_mean(Nm),L_My_sd(Nm),L_Mz_mean(Nm),L_Mz_sd(Nm)," \
+            "R_Mx_mean(Nm),R_Mx_sd(Nm),R_My_mean(Nm),R_My_sd(Nm),R_Mz_mean(Nm),R_Mz_sd(Nm)"
+        )
+        lines = [header]
+        # Fetch arrays, defaulting to zeros of length n
+        def safe(name: str, side: str, kind: str):
+            a = np.asarray(cmp.get(name, {}).get(side, {}).get(kind, np.zeros(n, np.float32)), dtype=np.float32)
+            return a if a.shape[0] == n else np.resize(a, (n,))
+        Lmx_m = safe('Mx','L','mean'); Lmx_s = safe('Mx','L','sd')
+        Lmy_m = safe('My','L','mean'); Lmy_s = safe('My','L','sd')
+        Lmz_m = safe('Mz','L','mean'); Lmz_s = safe('Mz','L','sd')
+        Rmx_m = safe('Mx','R','mean'); Rmx_s = safe('Mx','R','sd')
+        Rmy_m = safe('My','R','mean'); Rmy_s = safe('My','R','sd')
+        Rmz_m = safe('Mz','R','mean'); Rmz_s = safe('Mz','R','sd')
+        for i in range(n):
+            lines.append(
+                f"{phase[i]:.2f},"
+                f"{Lmx_m[i]:.6f},{Lmx_s[i]:.6f},"
+                f"{Lmy_m[i]:.6f},{Lmy_s[i]:.6f},"
+                f"{Lmz_m[i]:.6f},{Lmz_s[i]:.6f},"
+                f"{Rmx_m[i]:.6f},{Rmx_s[i]:.6f},"
+                f"{Rmy_m[i]:.6f},{Rmy_s[i]:.6f},"
+                f"{Rmz_m[i]:.6f},{Rmz_s[i]:.6f}"
+            )
+        return "\n".join(lines)
+
+    anchor_L_compare_csv = build_compare_csv(cycles_compare.get('anchor_L', {}))
+    anchor_R_compare_csv = build_compare_csv(cycles_compare.get('anchor_R', {}))
+
     # Event diagnostics (if available)
     event_quality = gait_results.get('event_quality', {}) if isinstance(gait_results, dict) else {}
+    detector_info = {
+        'detector': 'unified_gait',
+        'sampling_frequency': float(gait_results.get('sampling_frequency', Fs)),
+        'params': gait_results.get('detector_params', {}),
+        'filter_adjustments': gait_results.get('filter_adjustments', {}),
+    }
+
+    # Compute adaptive stance thresholds used (report only; stance shading uses events)
+    def _stance_thresholds_report(omega_W: np.ndarray, a_free_W: np.ndarray):
+        wmag = np.linalg.norm(omega_W, axis=1)
+        amag = np.linalg.norm(a_free_W, axis=1)
+        mad_w = float(1.4826 * np.median(np.abs(wmag - np.median(wmag)))) if wmag.size else 0.0
+        mad_a = float(1.4826 * np.median(np.abs(amag - np.median(amag)))) if amag.size else 0.0
+        th_w = float(max(2.0, 3.5 * mad_w))
+        th_a = float(max(0.8, 3.0 * mad_a))
+        return {'w_thr': th_w, 'a_thr': th_a, 'mad_w': mad_w, 'mad_a': mad_a}
+    stance_thresholds = {
+        'L': _stance_thresholds_report(omegaL_shank_W, aL_free_W),
+        'R': _stance_thresholds_report(omegaR_shank_W, aR_free_W),
+    }
     diag = {
         'left': {
             'hs_count': int(event_quality.get('left', {}).get('hs_count', int(contacts_L.size))),
@@ -826,6 +1007,7 @@ def run_pipeline_clean(data: dict, height_m: float, mass_kg: float, options: dic
         'left_angles_csv': left_angles_csv, 'right_angles_csv': right_angles_csv,
         'left_hip_cycle_csv': left_hip_cycle_csv, 'right_hip_cycle_csv': right_hip_cycle_csv,
         'left_knee_cycle_csv': left_knee_cycle_csv, 'right_knee_cycle_csv': right_knee_cycle_csv,
+    'anchor_L_compare_csv': anchor_L_compare_csv, 'anchor_R_compare_csv': anchor_R_compare_csv,
         'Lmean': Lmean, 'Lsd': Lsd, 'Rmean': Rmean, 'Rsd': Rsd,
         'cycles': cycles_out,
         'angle_cycles': { 'hip': hip_cycles, 'knee': knee_cycles },
@@ -840,6 +1022,16 @@ def run_pipeline_clean(data: dict, height_m: float, mass_kg: float, options: dic
             'magnitude_modes': ['mean_mag','mag_of_mean','rms_mag'],
             'angles_jcs': 'Grood–Suntay-inspired (hip,knee)',
             'events': diag,
+            'yaw_ref_source': yaw_src,
+            'yaw_ref_rad': float(yaw_ref),
+            'still_resample': {'method': 'interp+thr+close', 'threshold': 0.75, 'close_radius_samples': 1},
+            'moment_model': 'inertial+gravity (no GRF), teaching-grade',
+            'timebase': {'L': 'femur', 'R': 'femur'},
+            'fs_est': fs_meta,
+            'stance_thresholds_used': stance_thresholds,
+            'detector': detector_info,
+            'acc_gravity_correction': { 'L': acc_corr_L, 'R': acc_corr_R },
+            'overlap_window_s': overlap_meta,
         },
         'baseline_JCS': {
             'L': {'start': baseL0.astype(np.float32), 'end': baseL1.astype(np.float32)},

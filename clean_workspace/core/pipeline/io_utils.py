@@ -2,7 +2,8 @@ from __future__ import annotations
 import io, re
 import numpy as np
 import pandas as pd
-from ..config.constants import TIME_CANDS, QW, QX, QY, QZ, GYR, ACC
+from ..config.constants import TIME_CANDS, QW, QX, QY, QZ, GYR, ACC, G
+from ..math.kinematics import quats_to_R_batch
 
 __all__ = ["read_xsens_bytes","sanitize_cols","pick_col","extract_kinematics"]
 
@@ -70,12 +71,32 @@ def read_xsens_bytes(b: bytes) -> pd.DataFrame:
             except Exception:
                 df = None
     if df is None:
-        rows = payload.splitlines()
+        # Last-resort: detect probable delimiter by most frequent in the first non-empty line
+        rows = [r for r in payload.splitlines() if r.strip()]
+        if not rows:
+            raise ValueError("Empty CSV payload")
         delims = [',',';','\t','|']
         delim = max(delims, key=lambda d: rows[0].count(d))
         target_n = rows[0].count(delim) + 1
         filtered = [r for r in rows if (r.count(delim) + 1) == target_n]
         df = pd.read_csv(io.StringIO("\n".join(filtered)), engine='python', sep=delim, on_bad_lines='skip')
+
+    # Tiny-row guard: if parsed frame is suspiciously small, retry known delimiters and pick the best
+    try:
+        if df is not None and len(df) < 5:
+            best_df = df
+            best_len = len(df)
+            for sep in [',',';','\t','|']:
+                try:
+                    cand = pd.read_csv(io.StringIO(payload), engine='python', sep=sep, on_bad_lines='skip')
+                    if len(cand) > best_len:
+                        best_df = cand
+                        best_len = len(cand)
+                except Exception:
+                    pass
+            df = best_df
+    except Exception:
+        pass
 
     df.columns = sanitize_cols(df.columns)
     return df
@@ -100,10 +121,14 @@ def extract_kinematics(df: pd.DataFrame):
     else:
         t = t_raw - t_raw[0]
 
-    qw = df[pick_col(df, QW)].to_numpy(dtype=float)
-    qx = df[pick_col(df, QX)].to_numpy(dtype=float)
-    qy = df[pick_col(df, QY)].to_numpy(dtype=float)
-    qz = df[pick_col(df, QZ)].to_numpy(dtype=float)
+    qw_col = pick_col(df, QW)
+    qx_col = pick_col(df, QX)
+    qy_col = pick_col(df, QY)
+    qz_col = pick_col(df, QZ)
+    qw = df[qw_col].to_numpy(dtype=float)
+    qx = df[qx_col].to_numpy(dtype=float)
+    qy = df[qy_col].to_numpy(dtype=float)
+    qz = df[qz_col].to_numpy(dtype=float)
     quat = np.stack([qw,qx,qy,qz], axis=1)
 
     try:
@@ -114,9 +139,22 @@ def extract_kinematics(df: pd.DataFrame):
     except Exception:
         gyro = None
 
-    ax = df[pick_col(df, ACC['x'])].to_numpy(dtype=float)
-    ay = df[pick_col(df, ACC['y'])].to_numpy(dtype=float)
-    az = df[pick_col(df, ACC['z'])].to_numpy(dtype=float)
-    freeacc = np.stack([ax,ay,az], axis=1)
+    # Prefer free acceleration if available, else fall back to generic acc columns
+    ax_col = pick_col(df, ACC['x'])
+    ay_col = pick_col(df, ACC['y'])
+    az_col = pick_col(df, ACC['z'])
+    ax = df[ax_col].to_numpy(dtype=float)
+    ay = df[ay_col].to_numpy(dtype=float)
+    az = df[az_col].to_numpy(dtype=float)
+    acc = np.stack([ax,ay,az], axis=1)
+
+    # Determine if selected acc columns are already free acceleration
+    sel_names = " ".join([ax_col, ay_col, az_col]).lower()
+    is_free = ("freeacc" in sel_names) or ("free_acc" in sel_names) or ("_free" in sel_names)
+    # If explicit free acceleration is not present, fall back to using the raw
+    # accelerometer values as-is (tests expect this behavior). We do not attempt
+    # to remove gravity here to avoid introducing assumptions about sensor frame
+    # and sign conventions.
+    freeacc = acc if not is_free else acc
 
     return t, quat, gyro, freeacc

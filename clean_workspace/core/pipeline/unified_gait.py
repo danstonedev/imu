@@ -191,9 +191,28 @@ def detect_gait_cycles(*args, **kwargs) -> Dict[str, Any]:
         else:
             raise TypeError("detect_gait_cycles called with unsupported arguments")
 
+    # Low-fs safeguards for filter settings
+    # Default bands
+    vib_band_default = (8.0, 25.0)
+    gyro_lpf_default = 10.0
+    vib_band_used = list(vib_band_default)
+    gyro_lpf_used = float(gyro_lpf_default)
+    filter_adjustments: Dict[str, Any] = {}
+    if fs < 25.0:
+        # Narrow band for impact and reduce gyro LPF at low sampling rates
+        vib_band_used = [4.0, min(10.0, max(5.0, fs/2.0 - max(0.5, 0.05*fs)))]
+        gyro_lpf_used = min(6.0, max(2.0, fs/4.0))
+        filter_adjustments = {
+            'reason': 'low_fs',
+            'fs': float(fs),
+            'vib_band': tuple(vib_band_used),
+            'gyro_lpf': float(gyro_lpf_used),
+        }
+
     # Detect heel strikes for both legs
-    hs_left = detect_heel_strikes_biomech(t_left, accel_left, gyro_left, fs)
-    hs_right = detect_heel_strikes_biomech(t_right, accel_right, gyro_right, fs)
+    vib_band_tuple: Tuple[float, float] = (float(vib_band_used[0]), float(vib_band_used[1]))
+    hs_left = detect_heel_strikes_biomech(t_left, accel_left, gyro_left, fs, vib_band=vib_band_tuple, gyro_lpf=float(gyro_lpf_used))
+    hs_right = detect_heel_strikes_biomech(t_right, accel_right, gyro_right, fs, vib_band=vib_band_tuple, gyro_lpf=float(gyro_lpf_used))
 
     # Detect toe-offs based on heel strikes
     to_left = detect_toe_offs_biomech(t_left, accel_left, gyro_left, hs_left, fs)
@@ -208,7 +227,12 @@ def detect_gait_cycles(*args, **kwargs) -> Dict[str, Any]:
         'toe_offs_left': to_left,
         'toe_offs_right': to_right,
         'coordination_metrics': coordination,
-        'sampling_frequency': fs
+        'sampling_frequency': fs,
+        'detector_params': {
+            'vib_band_used': tuple(vib_band_used),
+            'gyro_lpf_used': float(gyro_lpf_used)
+        },
+        'filter_adjustments': filter_adjustments
     }
 
 def detect_toe_offs_biomech(

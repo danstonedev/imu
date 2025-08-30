@@ -16,7 +16,8 @@ from core.config.constants import STANCE_THR_W, STANCE_THR_A, STANCE_HYST_SAMPLE
 
 def test_bilateral_gait():
     # Load sample data
-    data_dir = Path("sample data")
+    root = Path(__file__).resolve().parent
+    data_dir = root / "sample data"
     files = {
         "ltibia": data_dir / "DEMO6_2_20250209_221452_174.csv",
         "rtibia": data_dir / "DEMO6_3_20250209_221452_179.csv",

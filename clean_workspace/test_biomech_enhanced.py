@@ -10,9 +10,14 @@ from core.pipeline.io_utils import read_xsens_bytes, extract_kinematics
 from core.pipeline.unified_gait import detect_gait_cycles
 from core.math.kinematics import quats_to_R_batch, world_vec, gyro_from_quat
 
+root = Path(__file__).resolve().parent
+
 def load_tibia_data(filepath):
     """Load tibia sensor data from CSV file."""
-    with open(filepath, "rb") as f:
+    path = Path(filepath)
+    if not path.is_absolute():
+        path = root / path
+    with open(path, "rb") as f:
         data_bytes = f.read()
     df = read_xsens_bytes(data_bytes)
     t, q, g, a = extract_kinematics(df)

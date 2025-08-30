@@ -4,7 +4,7 @@ This document extracts the math that powers the current prototype so we can rebu
 
 Assumptions and scope:
 
-- Teaching-grade inverse dynamics for hip moments without direct GRF, using IMU kinematics only (pelvis, femurs, tibias).
+- Teaching-grade inverse dynamics for hip moments without direct GRF, using IMU kinematics only (pelvis, femurs, tibias). These are NOT net joint moments; they are inertial+gravity estimates for visualization/teaching.
 - Robust, simple methods favored over full biomechanical fidelity.
 - Frames: S = sensor/body frame; W = world frame; J = joint coordinate system.
 - Quaternion convention: [w, x, y, z]. Rotation matrices map S→W.

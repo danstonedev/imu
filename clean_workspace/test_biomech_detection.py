@@ -10,7 +10,8 @@ sys.path.append(str(Path(__file__).parent))
 
 from core.pipeline.io_utils import read_xsens_bytes, extract_kinematics
 from core.pipeline.stance_cycles import composite_stance, contacts_from_stance
-from core.pipeline.heel_strike_detection import detect_heel_strikes_biomech, bilateral_gait_cycles
+from core.pipeline.heel_strike_detection import bilateral_gait_cycles
+from core.pipeline.unified_gait import detect_heel_strikes_biomech
 from core.math.kinematics import quats_to_R_batch, world_vec, gyro_from_quat, estimate_fs
 
 def compare_detection_methods():
