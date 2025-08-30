@@ -1,5 +1,6 @@
 from __future__ import annotations
 import numpy as np
+from dataclasses import dataclass
 
 __all__ = [
     "normalize_quat","quats_to_R_batch","yaw_from_R","apply_yaw_align",
@@ -7,6 +8,8 @@ __all__ = [
     "gyro_from_quat",
     # JCS-inspired angle helpers
     "jcs_hip_angles","jcs_knee_angles",
+    # Resampling utility
+    "SideResampled","resample_side_to_femur_time",
 ]
 
 def normalize_quat(q: np.ndarray) -> np.ndarray:
@@ -135,6 +138,34 @@ def gyro_from_quat(t: np.ndarray, quat: np.ndarray) -> np.ndarray:
     if Tn > 1:
         w[-1] = w[-2]
     return w
+
+@dataclass
+class SideResampled:
+    t: np.ndarray
+    q_femur: np.ndarray; gyro_femur: np.ndarray; acc_femur: np.ndarray
+    q_tibia: np.ndarray; gyro_tibia: np.ndarray; acc_tibia: np.ndarray
+    q_pelvis: np.ndarray
+
+def resample_side_to_femur_time(
+    tF: np.ndarray, qF: np.ndarray, gF: np.ndarray, aF: np.ndarray,
+    tT: np.ndarray, qT: np.ndarray, gT: np.ndarray, aT: np.ndarray,
+    tP: np.ndarray, qP: np.ndarray,
+) -> SideResampled:
+    """Resample tibia and pelvis onto the femur timebase and return a structured bundle."""
+    tF0 = tF - tF[0]
+    tT0 = tT - tT[0]
+    tP0 = tP - tP[0]
+    t = tF0.copy()
+    return SideResampled(
+        t=t,
+        q_femur=qF,
+        gyro_femur=gF,
+        acc_femur=aF,
+        q_tibia=resample_quat(tT0, qT, t),
+        gyro_tibia=resample_vec(tT0, gT, t),
+        acc_tibia=resample_vec(tT0, aT, t),
+        q_pelvis=resample_quat(tP0, qP, t),
+    )
 
 # -----------------------------
 # Grood–Suntay-inspired JCS angles

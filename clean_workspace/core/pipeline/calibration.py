@@ -1,5 +1,7 @@
 from __future__ import annotations
 import numpy as np
+from dataclasses import dataclass
+from typing import Dict, Tuple, List
 from ..config.constants import (
     STILL_THR_W, STILL_THR_A, STILL_SMOOTH_S,
     STILL_MIN_S_PRIMARY, STILL_MIN_S_SECONDARY, STILL_EDGE_FRAC,
@@ -9,8 +11,22 @@ from ..math.kinematics import moving_avg
 
 __all__ = [
     "detect_still","find_still_segments","pick_edge_segments",
-    "calibration_windows_secs","calibrate_bias_trimmed",
+    "calibration_windows_secs","calibrate_bias_trimmed","calibrate_all","CalibrationResult",
 ]
+
+@dataclass
+class CalibrationResult:
+    """Container for calibration artifacts computed in a single pass.
+
+    windows: List of dicts with start/end seconds for still windows (pelvis timeline).
+    yaw_ref: Chosen yaw reference in radians (float).
+    yaw_source: Source tag for yaw reference ('start'|'end'|'global').
+    biases: Map from segment name to (gyro_bias[3], acc_bias[3]) arrays.
+    """
+    windows: List[dict]
+    yaw_ref: float
+    yaw_source: str
+    biases: Dict[str, Tuple[np.ndarray, np.ndarray]]
 
 def detect_still(t: np.ndarray, gyro: np.ndarray, freeacc: np.ndarray):
     t = np.asarray(t, float)
@@ -135,3 +151,72 @@ def calibrate_bias_trimmed(gyro_S: np.ndarray, freeacc_S: np.ndarray, still_rang
     if wsum <= 0:
         return np.zeros(3), np.zeros(3)
     return g_acc/wsum, a_acc/wsum
+
+
+def calibrate_all(
+    tP: np.ndarray,
+    RP_raw: np.ndarray,
+    stillP: np.ndarray | None,
+    cal_windows: List[dict] | None,
+    segments: Dict[str, Tuple[np.ndarray | None, np.ndarray | None]],
+) -> CalibrationResult:
+    """One-shot calibration: choose yaw reference and compute per-segment biases.
+
+    - tP: pelvis time (s) for indexing windows
+    - RP_raw: pelvis world rotations (T,3,3) BEFORE yaw alignment
+    - stillP: pelvis still mask (T,)
+    - cal_windows: windows as produced by calibration_windows_secs (seconds)
+    - segments: name -> (gyro_S, freeacc_S) in sensor frame
+    """
+    # Import inside function to avoid circular import at module import time
+    from .pipeline import compute_yaw_reference  # type: ignore
+
+    # 1) windows (already in seconds); allow None -> empty list
+    wins: List[dict] = list(cal_windows or [])
+
+    # 2) yaw reference using existing, proven logic
+    yaw_ref, yaw_source = compute_yaw_reference(tP, RP_raw, stillP, wins)
+
+    # 3) convert second-based windows to index ranges on pelvis timeline
+    ranges: List[tuple[int, int]] = []
+    for w in wins:
+        try:
+            s = int(np.searchsorted(tP, float(w['start_s']), side='left'))
+            e = int(np.searchsorted(tP, float(w['end_s']),   side='right'))
+        except Exception:
+            continue
+        s = max(0, min(s, len(tP)))
+        e = max(s + 1, min(e, len(tP)))
+        ranges.append((s, e))
+
+    def _trimmed_mean(X: np.ndarray | None, trim: float = 0.1) -> np.ndarray:
+        if X is None:
+            return np.zeros(3, dtype=float)
+        X = np.asarray(X, dtype=float)
+        if X.ndim == 1:
+            X = X[:, None]
+        out = []
+        for j in range(min(3, X.shape[1])):
+            if ranges:
+                x = np.concatenate([X[s:e, j] for (s, e) in ranges])
+            else:
+                x = X[:, j]
+            x = np.sort(np.asarray(x, float))
+            n = len(x)
+            k = int(round(trim * n))
+            if n <= 2 * k:
+                out.append(0.0)
+            else:
+                out.append(float(np.mean(x[k:n - k])))
+        while len(out) < 3:
+            out.append(0.0)
+        return np.array(out, dtype=float)
+
+    # 4) per-segment robust trimmed means for gyro and acceleration
+    biases: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+    for name, (gyro_S, freeacc_S) in (segments or {}).items():
+        gb = _trimmed_mean(gyro_S, trim=0.1)
+        ab = _trimmed_mean(freeacc_S, trim=0.1)
+        biases[name] = (gb, ab)
+
+    return CalibrationResult(windows=wins, yaw_ref=float(yaw_ref), yaw_source=str(yaw_source), biases=biases)

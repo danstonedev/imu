@@ -6,17 +6,17 @@ from typing import Any
 from ..math.kinematics import (
     quats_to_R_batch, yaw_from_R, apply_yaw_align, resample_quat, resample_vec,
     moving_avg, world_vec, estimate_fs, gyro_from_quat,
-    jcs_hip_angles, jcs_knee_angles,
+    jcs_hip_angles, jcs_knee_angles, resample_side_to_femur_time,
 )
 from ..math.inverse_dynamics import hip_inverse_dynamics, hip_jcs_from_R, resolve_in_jcs
 from ..math.conventions import enforce_lr_conventions
-from .io_utils import read_xsens_bytes, extract_kinematics
-from .calibration import detect_still, calibration_windows_secs, calibrate_bias_trimmed
+from .io_utils import read_xsens_bytes, extract_kinematics, extract_kinematics_ex
+from .calibration import detect_still, calibration_windows_secs, calibrate_bias_trimmed, calibrate_all
 from .unified_gait import detect_gait_cycles, gait_cycle_analysis
 
 __all__ = ["run_pipeline_clean", "compute_yaw_reference"]
 
-def compute_yaw_reference(tP: np.ndarray, RP_raw: np.ndarray, stillP: np.ndarray, cal_windows: list[dict] | None) -> tuple[float, str]:
+def compute_yaw_reference(tP: np.ndarray, RP_raw: np.ndarray, stillP: np.ndarray | None, cal_windows: list[dict] | None) -> tuple[float, str]:
     """
     Compute a stable yaw reference using only the start still window when available,
     else the end window, otherwise fall back to median over the provided still mask
@@ -83,11 +83,11 @@ def run_pipeline_clean(data: dict, height_m: float, mass_kg: float, options: dic
     lt  = read_xsens_bytes(lt_bytes)
     rt  = read_xsens_bytes(rt_bytes)
 
-    tP, qP, gP, aP = extract_kinematics(pel)
-    tLf, qLf, gLf, aLf = extract_kinematics(lf)
-    tRf, qRf, gRf, aRf = extract_kinematics(rf)
-    tLt, qLt, gLt, aLt = extract_kinematics(lt)
-    tRt, qRt, gRt, aRt = extract_kinematics(rt)
+    tP, qP, gP, aP, metaP = extract_kinematics_ex(pel)
+    tLf, qLf, gLf, aLf, _ = extract_kinematics_ex(lf)
+    tRf, qRf, gRf, aRf, _ = extract_kinematics_ex(rf)
+    tLt, qLt, gLt, aLt, _ = extract_kinematics_ex(lt)
+    tRt, qRt, gRt, aRt, _ = extract_kinematics_ex(rt)
 
     # Fallback: derive gyro from quaternions where missing
     if gLf is None:
@@ -108,37 +108,36 @@ def run_pipeline_clean(data: dict, height_m: float, mass_kg: float, options: dic
     # windows in seconds on pelvis time
     cal_windows = calibration_windows_secs(tP, stillP, Fs)
 
-    if do_cal and cal_windows:
-        # Convert window seconds back to indices on pelvis arrays
-        idx_windows = []
-        for w in cal_windows:
-            s = int(np.searchsorted(tP, float(w['start_s']), side='left'))
-            e = int(np.searchsorted(tP, float(w['end_s']), side='right'))
-            s = max(0, min(s, len(tP)))
-            e = max(s+1, min(e, len(tP)))
-            idx_windows.append((s,e))
-        gpb, apb = calibrate_bias_trimmed(gP, aP, idx_windows)
-    else:
-        gpb = np.zeros(3); apb = np.zeros(3)
-
-    def apply_bias(g, a):
-        return g - gpb, a - apb
-
-    gLf, aLf = apply_bias(gLf, aLf)
-    gRf, aRf = apply_bias(gRf, aRf)
-    gLt, aLt = apply_bias(gLt, aLt)
-    gRt, aRt = apply_bias(gRt, aRt)
-
+    # One-shot calibration: per-segment biases and yaw reference (pelvis driven)
     RP_raw = quats_to_R_batch(qP)
+    if do_cal:
+        seg_for_bias = {
+            'pelvis':  (gP, aP),
+            'L_femur': (gLf, aLf), 'R_femur': (gRf, aRf),
+            'L_tibia': (gLt, aLt), 'R_tibia': (gRt, aRt),
+        }
+        cal = calibrate_all(tP, RP_raw, stillP, cal_windows, seg_for_bias)
+        def _apply_bias(name, g, a):
+            gb, ab = cal.biases.get(name, (np.zeros(3), np.zeros(3)))
+            return (None if g is None else g - gb), (None if a is None else a - ab)
+        gP,  aP  = _apply_bias('pelvis',  gP,  aP)
+        gLf, aLf = _apply_bias('L_femur', gLf, aLf)
+        gRf, aRf = _apply_bias('R_femur', gRf, aRf)
+        gLt, aLt = _apply_bias('L_tibia', gLt, aLt)
+        gRt, aRt = _apply_bias('R_tibia', gRt, aRt)
+        yaw_ref, yaw_src = cal.yaw_ref, cal.yaw_source
+    else:
+        yaw_ref, yaw_src = 0.0, "global"
+
     RLf_raw = quats_to_R_batch(qLf)
     RRf_raw = quats_to_R_batch(qRf)
     RLt_raw = quats_to_R_batch(qLt)
     RRt_raw = quats_to_R_batch(qRt)
 
-    # Choose a single pelvis-based yaw reference using only start (then end) still window
-    if yaw_align_flag:
+    # If calibration didn't run or yaw_align disabled, compute or null yaw as needed
+    if yaw_align_flag and not do_cal:
         yaw_ref, yaw_src = compute_yaw_reference(tP, RP_raw, stillP, cal_windows)
-    else:
+    if not yaw_align_flag:
         yaw_ref, yaw_src = 0.0, "global"
 
     # ---------------------------------------------
@@ -152,7 +151,7 @@ def run_pipeline_clean(data: dict, height_m: float, mass_kg: float, options: dic
             return 0.0, 0.0
         return max(t0s), min(t1s)
 
-    def _trim_time_series(t: np.ndarray, *arrs: np.ndarray, start: float, end: float) -> tuple:
+    def _trim_time_series(t: np.ndarray, *arrs: np.ndarray | None, start: float, end: float) -> tuple:
         if t is None or len(t) == 0:
             return (t, *arrs)
         if end <= start:
@@ -163,13 +162,13 @@ def run_pipeline_clean(data: dict, height_m: float, mass_kg: float, options: dic
             return (t, *arrs)
         idx = np.where(m)[0]
         t2 = t[idx]
-        out = [t2]
+        trimmed = []
         for a in arrs:
             if a is None:
-                out.append(a)
+                trimmed.append(None)
             else:
-                out.append(a[idx])
-        return tuple(out)
+                trimmed.append(a[idx])
+        return tuple([t2, *trimmed])
 
     ov_start, ov_end = _overlap_window([tP, tLf, tRf, tLt, tRt])
     overlap_meta = {
@@ -196,21 +195,16 @@ def run_pipeline_clean(data: dict, height_m: float, mass_kg: float, options: dic
         tRf, qRf, gRf, aRf = _trim_time_series(tRf, qRf, gRf, aRf, start=ov_start, end=ov_end)
         tRt, qRt, gRt, aRt = _trim_time_series(tRt, qRt, gRt, aRt, start=ov_start, end=ov_end)
 
-    def resample_side(tF, qF, gF, aF, tT, qT, gT, aT, tP, qP):
-        tF = tF - tF[0]; tT = tT - tT[0]; tP = tP - tP[0]
-        t_common = tF.copy()
-        qT_r = resample_quat(tT, qT, t_common)
-        gT_r = resample_vec(tT, gT, t_common)
-        aT_r = resample_vec(tT, aT, t_common)
-        qP_r = resample_quat(tP, qP, t_common)
-        return t_common, qF, gF, aF, qT_r, gT_r, aT_r, qP_r
-
-    tL, qLf_res, gLf_res, aLf_res, qLt_res, gLt_res, aLt_res, qP_L = resample_side(
-        tLf, qLf, gLf, aLf, tLt, qLt, gLt, aLt, tP, qP
-    )
-    tR, qRf_res, gRf_res, aRf_res, qRt_res, gRt_res, aRt_res, qP_R = resample_side(
-        tRf, qRf, gRf, aRf, tRt, qRt, gRt, aRt, tP, qP
-    )
+    # Shared resampling per side (to femur time)
+    # Type guards to satisfy static checkers (these should be true at runtime)
+    assert gLf is not None and aLf is not None and gLt is not None and aLt is not None
+    assert gRf is not None and aRf is not None and gRt is not None and aRt is not None
+    L_res = resample_side_to_femur_time(tLf, qLf, gLf, aLf, tLt, qLt, gLt, aLt, tP, qP)
+    R_res = resample_side_to_femur_time(tRf, qRf, gRf, aRf, tRt, qRt, gRt, aRt, tP, qP)
+    tL = L_res.t; qLf_res = L_res.q_femur; gLf_res = L_res.gyro_femur; aLf_res = L_res.acc_femur
+    qLt_res = L_res.q_tibia; gLt_res = L_res.gyro_tibia; aLt_res = L_res.acc_tibia; qP_L = L_res.q_pelvis
+    tR = R_res.t; qRf_res = R_res.q_femur; gRf_res = R_res.gyro_femur; aRf_res = R_res.acc_femur
+    qRt_res = R_res.q_tibia; gRt_res = R_res.gyro_tibia; aRt_res = R_res.acc_tibia; qP_R = R_res.q_pelvis
 
     RLf = quats_to_R_batch(qLf_res)
     RLt = quats_to_R_batch(qLt_res)
@@ -257,21 +251,18 @@ def run_pipeline_clean(data: dict, height_m: float, mass_kg: float, options: dic
     omegaR_shank_W = world_vec(RRt, gRt_res)
     aR_W = world_vec(RRt, aRt_res)
 
-    # If inputs lacked explicit freeacc_*, a_* may include gravity. Auto-correct in world frame.
+    # Make gravity handling explicit from headers, with optional safety net
     from ..config.constants import G as G_W
-    def gravity_correct_if_needed(aW: np.ndarray) -> tuple[np.ndarray, dict]:
+    acc_is_free = bool(metaP.get('acc_is_free', False))
+    def gravity_handle(aW: np.ndarray) -> tuple[np.ndarray, dict]:
         if aW is None or len(aW) == 0:
-            return aW, {'applied': False}
-        # Check median vertical component against expected gravity
-        z_med = float(np.median(aW[:, 2]))
-        gz = float(G_W[2])  # typically -9.80665
-        # If close to gravity (within ~2 m/s^2), assume raw and subtract G
-        if np.isfinite(z_med) and abs(z_med - gz) < 2.0:
-            return (aW - G_W).astype(np.float32), {'applied': True, 'z_median_before': z_med}
-        return aW.astype(np.float32), {'applied': False, 'z_median_before': z_med}
-
-    aL_free_W, acc_corr_L = gravity_correct_if_needed(aL_W)
-    aR_free_W, acc_corr_R = gravity_correct_if_needed(aR_W)
+            return aW, {'applied': False, 'mode': 'none'}
+        if acc_is_free:
+            return aW.astype(np.float32), {'applied': False, 'mode': 'freeacc_headers'}
+        # Assume raw accelerometer: subtract gravity in world frame
+        return (aW - G_W).astype(np.float32), {'applied': True, 'mode': 'subtract_g_world'}
+    aL_free_W, acc_corr_L = gravity_handle(aL_W)
+    aR_free_W, acc_corr_R = gravity_handle(aR_W)
 
     # Unified biomechanical gait cycle detection
     gait_results = detect_gait_cycles(

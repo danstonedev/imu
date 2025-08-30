@@ -5,7 +5,7 @@ import pandas as pd
 from ..config.constants import TIME_CANDS, QW, QX, QY, QZ, GYR, ACC, G
 from ..math.kinematics import quats_to_R_batch
 
-__all__ = ["read_xsens_bytes","sanitize_cols","pick_col","extract_kinematics"]
+__all__ = ["read_xsens_bytes","sanitize_cols","pick_col","extract_kinematics","extract_kinematics_ex"]
 
 def sanitize_cols(cols):
     sc = []
@@ -158,3 +158,54 @@ def extract_kinematics(df: pd.DataFrame):
     freeacc = acc if not is_free else acc
 
     return t, quat, gyro, freeacc
+
+
+def extract_kinematics_ex(df: pd.DataFrame):
+    """Extended extractor that returns whether acceleration columns are already free acceleration.
+
+    Returns: t, quat, gyro, freeacc, meta where meta has keys:
+      - acc_is_free: bool
+      - acc_cols: tuple of selected acceleration column names
+    """
+    t_col = pick_col(df, TIME_CANDS)
+    t_raw = df[t_col].to_numpy(dtype=float)
+    if 'sampletimefine' in t_col:
+        t = (t_raw - t_raw[0]) / 1e6
+    else:
+        t = t_raw - t_raw[0]
+
+    qw_col = pick_col(df, QW)
+    qx_col = pick_col(df, QX)
+    qy_col = pick_col(df, QY)
+    qz_col = pick_col(df, QZ)
+    qw = df[qw_col].to_numpy(dtype=float)
+    qx = df[qx_col].to_numpy(dtype=float)
+    qy = df[qy_col].to_numpy(dtype=float)
+    qz = df[qz_col].to_numpy(dtype=float)
+    quat = np.stack([qw, qx, qy, qz], axis=1)
+
+    try:
+        gx = df[pick_col(df, GYR['x'])].to_numpy(dtype=float) * (np.pi/180.0)
+        gy = df[pick_col(df, GYR['y'])].to_numpy(dtype=float) * (np.pi/180.0)
+        gz = df[pick_col(df, GYR['z'])].to_numpy(dtype=float) * (np.pi/180.0)
+        gyro = np.stack([gx, gy, gz], axis=1)
+    except Exception:
+        gyro = None
+
+    ax_col = pick_col(df, ACC['x'])
+    ay_col = pick_col(df, ACC['y'])
+    az_col = pick_col(df, ACC['z'])
+    ax = df[ax_col].to_numpy(dtype=float)
+    ay = df[ay_col].to_numpy(dtype=float)
+    az = df[az_col].to_numpy(dtype=float)
+    acc = np.stack([ax, ay, az], axis=1)
+
+    sel_names = " ".join([ax_col, ay_col, az_col]).lower()
+    is_free = ("freeacc" in sel_names) or ("free_acc" in sel_names) or ("_free" in sel_names)
+    freeacc = acc  # we pass through values unchanged here; interpretation handled upstream
+
+    meta = {
+        'acc_is_free': bool(is_free),
+        'acc_cols': (ax_col, ay_col, az_col),
+    }
+    return t, quat, gyro, freeacc, meta
