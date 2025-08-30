@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hip Torque Analysis</title>
+    <link rel="stylesheet" href="/static/css/style.css?v=3">
+</head>
+<body>
+    <div class="container">
+        <h1>Hip Torque Analysis</h1>
+        <form id="upload-form">
+            <div class="form-group">
+                <label for="height">Height (m):</label>
+                <input type="number" id="height" name="height_m" step="0.01" value="1.75" required>
+            </div>
+            <div class="form-group">
+                <label for="mass">Mass (kg):</label>
+                <input type="number" id="mass" name="mass_kg" step="0.1" value="100" required>
+            </div>
+            <div class="form-group">
+                <label for="data-input">Choose data (CSV files, a folder, or a ZIP):</label>
+                <input type="file" id="data-input" accept=".csv,.zip" multiple webkitdirectory>
+                <small class="hint">Pick one: (a) a single ZIP with multiple tests, (b) a folder containing test subfolders, or (c) the 5 CSVs. Leave blank to use sample data.</small>
+            </div>
+            <p class="hint">Tips: Use filenames with indices _0.._4 (e.g., DEMO6_0_*.csv) or role keywords (pelvis, lfemur, rfemur, ltibia, rtibia). When selecting a folder, we’ll preserve subfolder paths to group tests.</p>
+            <div class="actions">
+                <button type="submit">Run Analysis</button>
+                <button type="button" id="run-sample">Run with Sample Data</button>
+            </div>
+        </form>
+        <div id="results" class="hidden">
+            <h2>Results</h2>
+            <div id="dataset-picker" class="hidden dataset-picker">
+                <label for="dataset-select">Dataset:</label>
+                <select id="dataset-select"></select>
+            </div>
+            <div class="tabs">
+                <button type="button" class="tab-btn active" data-tab="time">Time Series</button>
+                <button type="button" class="tab-btn" data-tab="cycle">Cycle Averages</button>
+                <button type="button" class="tab-btn" data-tab="angles-time">Angles (time)</button>
+                <button type="button" class="tab-btn" data-tab="angles-cycle">Angle cycles</button>
+                <button type="button" class="tab-btn" data-tab="metrics">Metrics</button>
+            </div>
+            <div class="tab-panel" id="tab-time">
+                <div class="controls">
+                    <label><input type="checkbox" id="show-mx"> Mx</label>
+                    <label><input type="checkbox" id="show-my"> My</label>
+                    <label><input type="checkbox" id="show-mz"> Mz</label>
+                    <label><input type="checkbox" id="show-mmag" checked> |M|</label>
+                    <label for="time-side">Side:</label>
+                    <select id="time-side">
+                        <option value="both" selected>Both</option>
+                        <option value="L">Left only</option>
+                        <option value="R">Right only</option>
+                    </select>
+                    <label for="baseline-mode">Baseline:</label>
+                    <select id="baseline-mode">
+                        <option value="linear" selected>Linear</option>
+                        <option value="constant">Constant</option>
+                        <option value="none">None</option>
+                    </select>
+                    <!-- Normalization is enforced by default in code -->
+                    <button type="button" id="reset-zoom">Reset Zoom</button>
+                </div>
+                <div class="chart-container">
+                    <h3>Hip Time Series (overlay)</h3>
+                    <div id="time-overlay" class="d3-chart"></div>
+                </div>
+            </div>
+            <div class="tab-panel hidden" id="tab-angles-time">
+                <div class="controls">
+                    <label for="angle-time-joint">Joint:</label>
+                    <select id="angle-time-joint">
+                        <option value="hip" selected>Hip</option>
+                        <option value="knee">Knee</option>
+                    </select>
+                    <label><input type="checkbox" id="show-ang-flex" checked> Flex</label>
+                    <label><input type="checkbox" id="show-ang-add" checked> Add</label>
+                    <label><input type="checkbox" id="show-ang-rot" checked> Rot</label>
+                    <label for="time-angle-side">Side:</label>
+                    <select id="time-angle-side">
+                        <option value="both" selected>Both</option>
+                        <option value="L">Left only</option>
+                        <option value="R">Right only</option>
+                    </select>
+                    <button type="button" id="reset-angles-zoom">Reset Zoom</button>
+                </div>
+                <div class="chart-container">
+                    <h3>Joint Angles (overlay)</h3>
+                    <div id="angles-time-chart" class="d3-chart"></div>
+                </div>
+            </div>
+            <div class="tab-panel hidden" id="tab-angles-cycle">
+                <div class="controls">
+                    <label for="angle-cycle-joint">Joint:</label>
+                    <select id="angle-cycle-joint">
+                        <option value="hip" selected>Hip</option>
+                        <option value="knee">Knee</option>
+                    </select>
+                    <label for="angle-cycle-component">Component:</label>
+                    <select id="angle-cycle-component">
+                        <option value="flex" selected>Flex</option>
+                        <option value="add">Add</option>
+                        <option value="rot">Rot</option>
+                    </select>
+                </div>
+                <div class="chart-container">
+                    <h3>Angle Cycle Mean ± SD (Left vs Right)</h3>
+                    <div id="angles-cycle-chart" class="d3-chart"></div>
+                </div>
+            </div>
+            <div class="tab-panel hidden" id="tab-cycle">
+                <div class="controls">
+                    <label for="cycle-component">Component:</label>
+                    <select id="cycle-component">
+                        <option value="Mx">Mx</option>
+                        <option value="My">My</option>
+                        <option value="Mz">Mz</option>
+                        <option value="Mmag" selected>|M|</option>
+                    </select>
+                    <span id="mag-mode-wrap" class="mag-mode-wrap">
+                        <label for="mag-mode">Magnitude:</label>
+                        <select id="mag-mode" title="Choose how to display |M|: Average magnitude E|M|, Magnitude of average |E[M]|, or RMS magnitude. Mean(|M|) ≥ |Mean(M)| (Jensen).">
+                            <option value="mean_mag" selected>Average magnitude (E|M|)</option>
+                            <option value="mag_of_mean">Magnitude of average (|E[M]|)</option>
+                            <option value="rms_mag">RMS magnitude</option>
+                        </select>
+                        <span class="info" title="Quick checks:\n|E[M]| = sqrt((E[Mx])^2 + (E[My])^2 + (E[Mz])^2) → near 0 at HS if components cancel.\nE[|M|] = mean across strides of sqrt(Mx^2 + My^2 + Mz^2) → typical size.\nRMS(|M|) = sqrt(E[Mx^2] + E[My^2] + E[Mz^2]) → weights larger excursions.\nMean(|M|) ≥ |Mean(M)| (Jensen); the gap reflects stride-to-stride directional variability.">?</span>
+                    </span>
+                    <label for="cycle-anchor">Anchor:</label>
+                    <select id="cycle-anchor">
+                        <option value="anchor_L">Left (ref)</option>
+                        <option value="anchor_R">Right (ref)</option>
+                        <option value="independent" selected>Independent</option>
+                    </select>
+                    <!-- Angle overlay controls removed to keep torque and ROM separate -->
+                    <!-- Normalization is enforced by default in code -->
+                </div>
+                <div class="chart-container">
+                    <h3>Cycle Mean ± SD (Left vs Right)</h3>
+                    <div id="cycle-compare-d3" class="d3-chart"></div>
+                </div>
+                <div id="cycle-corr" class="cycle-corr"></div>
+            </div>
+            <div class="tab-panel hidden" id="tab-metrics">
+                <div id="metrics"></div>
+                <div class="download-links">
+                    <a id="left-csv-link" href="#" download="left_hip_torque.csv">Download Left CSV</a>
+                    <a id="right-csv-link" href="#" download="right_hip_torque.csv">Download Right CSV</a>
+                    <a id="left-cycle-csv-link" href="#" download="left_cycle_means.csv">Download Left Cycle CSV</a>
+                    <a id="right-cycle-csv-link" href="#" download="right_cycle_means.csv">Download Right Cycle CSV</a>
+                    <a id="left-angles-csv-link" href="#" download="left_angles.csv">Download Left Angles CSV</a>
+                    <a id="right-angles-csv-link" href="#" download="right_angles.csv">Download Right Angles CSV</a>
+                    <a id="left-hip-cycle-angles-csv-link" href="#" download="left_hip_cycle_angles.csv">Download Left Hip Cycle Angles</a>
+                    <a id="right-hip-cycle-angles-csv-link" href="#" download="right_hip_cycle_angles.csv">Download Right Hip Cycle Angles</a>
+                    <a id="left-knee-cycle-angles-csv-link" href="#" download="left_knee_cycle_angles.csv">Download Left Knee Cycle Angles</a>
+                    <a id="right-knee-cycle-angles-csv-link" href="#" download="right_knee_cycle_angles.csv">Download Right Knee Cycle Angles</a>
+                </div>
+            </div>
+        </div>
+        <div id="loading" class="hidden">
+            <p>Analyzing data, please wait...</p>
+        </div>
+        <div id="error" class="hidden">
+            <p>An error occurred. Please check your inputs and try again.</p>
+        </div>
+    </div>
+    <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+    <script src="/static/js/main.js?v=6"></script>
+</body>
+</html>

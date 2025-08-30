@@ -1,0 +1,15 @@
+[project]
+name = "hip_torque_core"
+version = "0.0.1"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=2.0",
+  "pandas>=2.2.3",
+  "fastapi>=0.110",
+  "uvicorn[standard]>=0.27",
+  "python-multipart>=0.0.9",
+]
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
