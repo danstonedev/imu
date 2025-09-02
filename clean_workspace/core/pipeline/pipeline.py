@@ -958,7 +958,9 @@ def run_pipeline_clean(
         idx = idx[(idx >= 0) & (idx < nT)]
         if idx.size < 2:
             return []
-        return [(int(a), int(b)) for a, b in zip(idx[:-1], idx[1:]) if int(b) > int(a) + 1]
+        return [
+            (int(a), int(b)) for a, b in zip(idx[:-1], idx[1:]) if int(b) > int(a) + 1
+        ]
 
     stride_L = _stride_windows(contacts_L, len(tL))
     stride_R = _stride_windows(contacts_R, len(tR))
@@ -984,7 +986,9 @@ def run_pipeline_clean(
     )
 
     # Apply to hip/knee angles (convert deg->rad, correct, back to deg)
-    def _apply_baseline_angles(A_deg: np.ndarray, t_side: np.ndarray, strides, cfg: BaselineConfig) -> np.ndarray:
+    def _apply_baseline_angles(
+        A_deg: np.ndarray, t_side: np.ndarray, strides, cfg: BaselineConfig
+    ) -> np.ndarray:
         if A_deg is None or len(A_deg) == 0:
             return A_deg
         A_rad = np.deg2rad(np.asarray(A_deg, dtype=np.float64))
@@ -1180,16 +1184,33 @@ def run_pipeline_clean(
 
     # Angle baselines for hip/knee now handled via stridewise baseline correction.
     # Keep pelvis baseline subtraction (constant from start window) as before for display stability.
-    def _unwrap_angles_in_deg(A_deg: np.ndarray) -> np.ndarray:
+    def _unwrap_angles_in_deg(A_deg: np.ndarray, discont_deg: float = 180.0) -> np.ndarray:
         A = np.asarray(A_deg, dtype=np.float32)
         if A.ndim != 2 or A.shape[1] == 0:
             return A
         out = A.copy()
+        discont = np.deg2rad(float(discont_deg))
         for j in range(A.shape[1]):
             rad = np.deg2rad(out[:, j].astype(np.float64))
-            rad_u = np.unwrap(rad)
+            rad_u = np.unwrap(rad, discont=discont)
             out[:, j] = np.rad2deg(rad_u).astype(np.float32)
         return out
+
+    def _unwrap_step_limited_deg(A_deg: np.ndarray, step_limit_deg: float = 150.0) -> np.ndarray:
+        """Unwrap each channel using np.unwrap with a custom discontinuity threshold.
+
+        This avoids large ±360° wrap-like jumps while preserving genuine motion.
+        """
+        A = np.asarray(A_deg, dtype=np.float32)
+        if A.ndim != 2 or A.shape[0] < 2:
+            return A.copy()
+        out = A.copy().astype(np.float64)
+        discont = np.deg2rad(float(step_limit_deg))
+        for j in range(out.shape[1]):
+            rad = np.deg2rad(out[:, j])
+            rad_u = np.unwrap(rad, discont=discont)
+            out[:, j] = np.rad2deg(rad_u)
+        return out.astype(np.float32)
 
     def _pelvis_const_baseline(A_deg: np.ndarray, mask: np.ndarray):
         if (
@@ -1204,10 +1225,20 @@ def run_pipeline_clean(
         B = (A - b).astype(np.float32)
         return B, b, b
 
-    pelvisL_deg, pelvisL_b0, pelvisL_b1 = _pelvis_const_baseline(pelvisL_deg, startMaskL)
-    pelvisR_deg, pelvisR_b0, pelvisR_b1 = _pelvis_const_baseline(pelvisR_deg, startMaskR)
+    pelvisL_deg, pelvisL_b0, pelvisL_b1 = _pelvis_const_baseline(
+        pelvisL_deg, startMaskL
+    )
+    pelvisR_deg, pelvisR_b0, pelvisR_b1 = _pelvis_const_baseline(
+        pelvisR_deg, startMaskR
+    )
 
     # Angle flexion sign already enforced by enforce_lr_conventions
+
+    # Ensure continuity for joint angles to avoid wrap-like sample jumps (>150 deg)
+    hipL_deg = _unwrap_step_limited_deg(hipL_deg, step_limit_deg=150.0)
+    hipR_deg = _unwrap_step_limited_deg(hipR_deg, step_limit_deg=150.0)
+    kneeL_deg = _unwrap_step_limited_deg(kneeL_deg, step_limit_deg=150.0)
+    kneeR_deg = _unwrap_step_limited_deg(kneeR_deg, step_limit_deg=150.0)
 
     def resample_mean_sd(arr, n=101):
         if len(arr) < 2:

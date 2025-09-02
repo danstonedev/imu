@@ -25,6 +25,8 @@ class BaselineConfig:
     - stride_debias_axes: Axes to debias per stride (subset of {"X","Y","Z"})
     - highpass_fc_hz: Optional HP cutoff for final drift removal (Hz); None to disable
     - min_stride_samples: Minimum samples within a stride window to apply debias
+    - allow_stack: If False, do not combine yaw-share with stride-debias (fail-safe)
+    - rewrap_after: If True, wrap output angles to (-pi, pi] after correction
     """
 
     def __init__(
@@ -34,14 +36,18 @@ class BaselineConfig:
         yaw_share_fc_hz: float = 0.05,  # 0.03–0.05 Hz typical
         stride_debias_axes: tuple[str, ...] = ("Y", "Z"),
         highpass_fc_hz: float | None = None,  # e.g., 0.02–0.05 Hz or None
-        min_stride_samples: int = 20,
+        min_stride_samples: int = 30,
+        allow_stack: bool = False,
+    rewrap_after: bool = False,
     ):
         self.fs_hz = float(fs_hz)
         self.use_yaw_share = bool(use_yaw_share)
         self.yaw_share_fc_hz = float(yaw_share_fc_hz)
         self.stride_debias_axes = tuple(str(a).upper() for a in stride_debias_axes)
-        self.highpass_fc_hz = (None if highpass_fc_hz is None else float(highpass_fc_hz))
+        self.highpass_fc_hz = None if highpass_fc_hz is None else float(highpass_fc_hz)
         self.min_stride_samples = int(min_stride_samples)
+        self.allow_stack = bool(allow_stack)
+        self.rewrap_after = bool(rewrap_after)
 
 
 def unwrap_cols(A: np.ndarray) -> np.ndarray:
@@ -137,7 +143,7 @@ def stridewise_debias(
     X: np.ndarray,
     stride_indices: list[tuple[int, int]],
     axes=(1, 2),
-    min_samples: int = 20,
+    min_samples: int = 30,
 ) -> np.ndarray:
     """Subtract per-stride mean on selected columns. Safeguards short strides.
 
@@ -174,26 +180,50 @@ def apply_baseline_correction(
     euler_xyz: np.ndarray,  # (T,3) from hip/knee angles
     stride_indices: list[tuple[int, int]] | None,
     cfg: BaselineConfig,
+    # optional context for yaw-share if caller provides segment yaw traces
+    yaw_pelvis: np.ndarray | None = None,
+    yaw_femur: np.ndarray | None = None,
 ) -> np.ndarray:
     """
-    Pipeline: unwrap → (optional) yaw share context if needed → stride debias on Y/Z → (optional) HP → return corrected angles.
-    Note: operate on relative-angle channels; only re-wrap for plotting/CSV outside this function.
+        Fail-safe pipeline:
+            unwrap → (optional) yaw-share OR stride-debias (based on cfg.allow_stack) → (optional) HP → (optional) rewrap
 
-    This function does not perform yaw-sharing internally unless explicit yaw
-    traces are supplied to the dedicated `yaw_share_timevarying` helper by the caller.
+        - If cfg.use_yaw_share and yaws provided, prefer yaw-share. If allow_stack=False,
+            skip stride-debias to avoid double DC adjustments. If True, both can run.
+        - High-pass is OFF unless cfg.highpass_fc_hz is set to a positive value.
+            - If cfg.rewrap_after=True, wrap to (-pi, pi] for safe plotting/CSV.
+                Default is False to preserve continuity for downstream processing/tests.
     """
     A = np.asarray(euler_xyz, dtype=float)
     if A.ndim != 2 or A.shape[1] < 1:
         return A.copy()
     Au = unwrap_cols(A)
 
-    # Stride-wise DC removal on selected axes (default Y,Z)
-    if stride_indices:
+    did_share = False
+    # Yaw-share (time-varying LF alignment) if explicitly requested and data provided
+    if cfg.use_yaw_share and yaw_pelvis is not None and yaw_femur is not None:
+        # We do not overwrite Au here because Au are relative joint angles; yaw-share
+        # should be applied upstream to segment headings. We track that sharing occurred
+        # to avoid stacking debias if not allowed.
+        _yp, _yf = yaw_share_timevarying(yaw_pelvis, yaw_femur, cfg)
+        did_share = True
+
+    # Stride-wise DC removal on selected axes (default Y,Z), unless stacking is disallowed
+    if stride_indices and (cfg.allow_stack or not did_share):
         axes_idx = _axes_to_idx(cfg.stride_debias_axes)
-        Au = stridewise_debias(Au, stride_indices, axes=axes_idx, min_samples=cfg.min_stride_samples)
+        Au = stridewise_debias(
+            Au, stride_indices, axes=axes_idx, min_samples=cfg.min_stride_samples
+        )
 
     # Optional high-pass to clean residual drift (all axes)
-    if cfg.highpass_fc_hz is not None and float(cfg.highpass_fc_hz) > 0 and cfg.fs_hz > 0:
+    if (
+        cfg.highpass_fc_hz is not None
+        and float(cfg.highpass_fc_hz) > 0
+        and cfg.fs_hz > 0
+    ):
         Au = highpass(Au, cfg.fs_hz, float(cfg.highpass_fc_hz), order=2)
 
+    # Optional rewrap for downstream consumers
+    if cfg.rewrap_after:
+        Au = wrap_pi(Au)
     return Au

@@ -86,6 +86,7 @@ def apply_yaw_drift_correction(
     shared = (1.0 - alpha) * yp_lf + alpha * yf_lf
     yp_corr = yp + (shared - yp_lf)
     yf_corr = yf + (shared - yf_lf)
+    # Keep unwrapped for continuity; callers can wrap if exporting for plots
     return yp_corr, yf_corr
 
 
