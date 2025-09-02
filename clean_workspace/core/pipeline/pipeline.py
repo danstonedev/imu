@@ -99,6 +99,14 @@ def run_pipeline_clean(
     baseline_mode = (
         options.get("baseline_mode") if isinstance(options, dict) else None
     ) or "linear"
+    # Diagnostics and guards
+    angles_baseline_mode = (
+        options.get("angles_baseline_mode") if isinstance(options, dict) else None
+    )  # None | "none" | "yaw_share_only" | "stride_debias_only" | "highpass_only"
+    angles_highpass_fc = options.get("angles_highpass_fc") if isinstance(options, dict) else None
+    debug_assert = bool(options.get("debug_assert", False)) if isinstance(options, dict) else False
+    stride_dur_lo = float(options.get("stride_min_s", 0.4)) if isinstance(options, dict) else 0.4
+    stride_dur_hi = float(options.get("stride_max_s", 1.6)) if isinstance(options, dict) else 1.6
     cal_mode = (
         options.get("cal_mode") if isinstance(options, dict) else None
     ) or "advanced"
@@ -152,6 +160,14 @@ def run_pipeline_clean(
 
     # One-shot calibration: per-segment biases and yaw reference (pelvis driven)
     RP_raw = quats_to_R_batch(qP)
+    # Optional quaternion hygiene assertions
+    if debug_assert:
+        def _q_dev(q):
+            qq = np.asarray(q, dtype=float)
+            n = np.linalg.norm(qq, axis=1)
+            return float(np.nanmax(np.abs(n - 1.0))) if qq.ndim == 2 and qq.shape[1] == 4 else 0.0
+        dev_max = max(_q_dev(qP), _q_dev(qLf), _q_dev(qRf), _q_dev(qLt), _q_dev(qRt))
+        assert dev_max < 1e-3, f"Quaternion norm deviation too large: {dev_max:g}"
     if do_cal:
         seg_for_bias: dict[str, tuple[np.ndarray | None, np.ndarray | None]] = {
             "pelvis": (gP, aP),
@@ -376,7 +392,52 @@ def run_pipeline_clean(
     RP_R_ang = _apply_level(RP_R, R0R)
     RRf_ang = _apply_level(RRf, R0R)
     # Optional: time-varying yaw sharing to reduce drift (common-mode & relative)
+    # Baseline selection for angles: 'yaw_share' | 'stride_debias' | 'auto' (default)
+    def _pick_baseline_mode_auto(hipY_deg: np.ndarray, hipZ_deg: np.ndarray, fs: float, win_s: float = 10.0, thr_deg: float = 3.0) -> str:
+        try:
+            y = np.asarray(hipY_deg, dtype=float)
+            z = np.asarray(hipZ_deg, dtype=float)
+            n = int(min(y.size, z.size))
+            if n == 0 or not np.isfinite(fs) or fs <= 0:
+                return "yaw_share"
+            w = int(max(1, round(win_s * float(fs))))
+            if n < 2 * w:
+                return "yaw_share"
+            y0, y1 = np.nanmean(y[:w]), np.nanmean(y[-w:])
+            z0, z1 = np.nanmean(z[:w]), np.nanmean(z[-w:])
+            if any(not np.isfinite(v) for v in (y0, y1, z0, z1)):
+                return "yaw_share"
+            dy = abs(y1 - y0)
+            dz = abs(z1 - z0)
+            return "yaw_share" if (dy > thr_deg or dz > thr_deg) else "stride_debias"
+        except Exception:
+            return "yaw_share"
+
+    # Decide baseline selection before any pre-Euler yaw-sharing
+    angles_baseline_select = (
+        options.get("angles_baseline_select") if isinstance(options, dict) else None
+    ) or "auto"
+
+    # Build a quick provisional hip angle estimate (deg) without yaw-share to drive 'auto'
+    hipL_deg_probe = jcs_hip_angles(RP_L_ang, RLf_ang, side="L") * (180.0 / np.pi)
+    hipR_deg_probe = jcs_hip_angles(RP_R_ang, RRf_ang, side="R") * (180.0 / np.pi)
+    fsL_probe = metaLf.get("fs_hz") or float(estimate_fs(tLf))
+    fsR_probe = metaRf.get("fs_hz") or float(estimate_fs(tRf))
+    if angles_baseline_select == "auto":
+        pickL = _pick_baseline_mode_auto(hipL_deg_probe[:, 1], hipL_deg_probe[:, 2], fs=fsL_probe)
+        pickR = _pick_baseline_mode_auto(hipR_deg_probe[:, 1], hipR_deg_probe[:, 2], fs=fsR_probe)
+        angles_baseline_select = ("yaw_share" if (pickL == "yaw_share" or pickR == "yaw_share") else "stride_debias")
+
+    # Configure pre-Euler yaw share default based on selection
     yaw_share = (options.get("yaw_share") if isinstance(options, dict) else None) or {}
+    if angles_baseline_select == "yaw_share":
+        yaw_share.setdefault("enabled", True)
+        yaw_share.setdefault("fc_hz", 0.05)
+        yaw_share.setdefault("alpha", 0.5)
+        yaw_share.setdefault("order", 2)
+    else:
+        yaw_share["enabled"] = False
+
     if bool(yaw_share.get("enabled", False)):
 
         def _rz_series(dyaw: np.ndarray) -> np.ndarray:
@@ -965,40 +1026,108 @@ def run_pipeline_clean(
     stride_L = _stride_windows(contacts_L, len(tL))
     stride_R = _stride_windows(contacts_R, len(tR))
 
+    # Filter strides by duration and exclude overlap with still masks
+    def _filter_strides_by_duration(strides, t_side, still_mask):
+        out = []
+        if not strides:
+            return out
+        for s, e in strides:
+            if e <= s + 1:
+                continue
+            dur = float(t_side[e - 1] - t_side[s])
+            if dur < stride_dur_lo or dur > stride_dur_hi:
+                continue
+            # Exclude strides that are mostly inside still windows
+            if still_mask is not None and len(still_mask) >= e:
+                seg = np.asarray(still_mask[s:e], dtype=bool)
+                if seg.size and (np.mean(seg) > 0.5):
+                    continue
+            out.append((s, e))
+        return out
+
+    stride_L = _filter_strides_by_duration(stride_L, tL, stillP[: len(tL)] if stillP is not None else None)
+    stride_R = _filter_strides_by_duration(stride_R, tR, stillP[: len(tR)] if stillP is not None else None)
+
     # Fs estimation per side
     fsL = float(estimate_fs(tL))
     fsR = float(estimate_fs(tR))
     cfgL = BaselineConfig(
         fs_hz=fsL,
-        use_yaw_share=False,
+        use_yaw_share=True,
         yaw_share_fc_hz=float(YAW_SHARE_FC_HZ),
         stride_debias_axes=tuple(STRIDE_DEBIAS_AXES),
-        highpass_fc_hz=(None if HP_FC_HZ is None else float(HP_FC_HZ)),
+        highpass_fc_hz=(float(angles_highpass_fc) if angles_highpass_fc is not None else (None if HP_FC_HZ is None else float(HP_FC_HZ))),
         min_stride_samples=int(MIN_STRIDE_SAMPLES),
+        rewrap_after=True,
     )
     cfgR = BaselineConfig(
         fs_hz=fsR,
-        use_yaw_share=False,
+        use_yaw_share=True,
         yaw_share_fc_hz=float(YAW_SHARE_FC_HZ),
         stride_debias_axes=tuple(STRIDE_DEBIAS_AXES),
-        highpass_fc_hz=(None if HP_FC_HZ is None else float(HP_FC_HZ)),
+        highpass_fc_hz=(float(angles_highpass_fc) if angles_highpass_fc is not None else (None if HP_FC_HZ is None else float(HP_FC_HZ))),
         min_stride_samples=int(MIN_STRIDE_SAMPLES),
+        rewrap_after=True,
     )
+
+    # If we used pre-Euler yaw-share, do not also yaw-share or stride-debias hips in baseline
+    use_pre_share = angles_baseline_select == "yaw_share"
+    cfgL.use_yaw_share = False
+    cfgR.use_yaw_share = False
 
     # Apply to hip/knee angles (convert deg->rad, correct, back to deg)
     def _apply_baseline_angles(
-        A_deg: np.ndarray, t_side: np.ndarray, strides, cfg: BaselineConfig
+        A_deg: np.ndarray,
+        t_side: np.ndarray,
+        strides,
+        cfg: BaselineConfig,
+        yaw_p=None,
+        yaw_f=None,
+        mode: str | None = None,
     ) -> np.ndarray:
         if A_deg is None or len(A_deg) == 0:
             return A_deg
         A_rad = np.deg2rad(np.asarray(A_deg, dtype=np.float64))
-        A_corr = apply_baseline_correction(t_side, A_rad, strides, cfg)
+        # Optional radian assertions
+        if debug_assert:
+            assert np.nanmax(np.abs(A_rad)) < 6.3 + 1e-3, "Angle processing must be in radians (< 2π)"
+        A_corr = apply_baseline_correction(
+            t_side,
+            A_rad,
+            strides,
+            cfg,
+            yaw_pelvis=(yaw_p if yaw_p is not None else None),
+            yaw_femur=(yaw_f if yaw_f is not None else None),
+            mode=mode,
+        )
         return np.rad2deg(A_corr).astype(np.float32)
 
-    hipL_deg = _apply_baseline_angles(hipL_deg, tL, stride_L, cfgL)
-    hipR_deg = _apply_baseline_angles(hipR_deg, tR, stride_R, cfgR)
-    kneeL_deg = _apply_baseline_angles(kneeL_deg, tL, stride_L, cfgL)
-    kneeR_deg = _apply_baseline_angles(kneeR_deg, tR, stride_R, cfgR)
+    # Provide yaw traces to diagnostic baseline when needed
+    yawP_L = yaw_from_R(RP_L_ang) if isinstance(RP_L_ang, np.ndarray) else None
+    yawP_R = yaw_from_R(RP_R_ang) if isinstance(RP_R_ang, np.ndarray) else None
+    yawF_L = yaw_from_R(RLf_ang) if isinstance(RLf_ang, np.ndarray) else None
+    yawF_R = yaw_from_R(RRf_ang) if isinstance(RRf_ang, np.ndarray) else None
+
+    hipL_deg = _apply_baseline_angles(
+        hipL_deg,
+        tL,
+        (None if use_pre_share else stride_L),  # no stride-debias on hips when pre-share is active
+        cfgL,
+        yaw_p=yawP_L,
+        yaw_f=yawF_L,
+        mode=angles_baseline_mode,
+    )
+    hipR_deg = _apply_baseline_angles(
+        hipR_deg,
+        tR,
+        (None if use_pre_share else stride_R),
+        cfgR,
+        yaw_p=yawP_R,
+        yaw_f=yawF_R,
+        mode=angles_baseline_mode,
+    )
+    kneeL_deg = _apply_baseline_angles(kneeL_deg, tL, stride_L, cfgL, yaw_p=yawP_L, yaw_f=yawF_L, mode=angles_baseline_mode)
+    kneeR_deg = _apply_baseline_angles(kneeR_deg, tR, stride_R, cfgR, yaw_p=yawP_R, yaw_f=yawF_R, mode=angles_baseline_mode)
 
     MhipL_W = hip_inverse_dynamics(tL, RLf, gLf_res, aLf_res, height_m, mass_kg)
     MhipR_W = hip_inverse_dynamics(tR, RRf, gRf_res, aRf_res, height_m, mass_kg)
@@ -1090,19 +1219,17 @@ def run_pipeline_clean(
             if tibia_still_R_base.size == maskR.size
             else maskR
         )
-        angles_baseline_source = {
-            "hip": "stridewise_debias(YZ)+HP" if HP_FC_HZ else "stridewise_debias(YZ)",
-            "knee": "stridewise_debias(YZ)+HP" if HP_FC_HZ else "stridewise_debias(YZ)",
-        }
     except Exception:
         hip_maskL_base = maskL
         hip_maskR_base = maskR
         knee_maskL_base = maskL
         knee_maskR_base = maskR
-        angles_baseline_source = {
-            "hip": "stridewise_debias(YZ)",
-            "knee": "stridewise_debias(YZ)",
-        }
+
+    # Describe selected baseline approach for reporting
+    hp_flag = bool(angles_highpass_fc) if angles_highpass_fc is not None else bool(HP_FC_HZ)
+    hip_src = ("preEuler_yaw_share" if use_pre_share else "stridewise_debias(YZ)") + ("+HP" if hp_flag else "")
+    knee_src = "stridewise_debias(YZ)" + ("+HP" if hp_flag else "")
+    angles_baseline_source = {"hip": hip_src, "knee": knee_src}
 
     # Fallback: build masks from explicit calibration windows if still masks are sparse
     def mask_from_windows(t_side: np.ndarray, delta: float):
@@ -1197,19 +1324,34 @@ def run_pipeline_clean(
         return out
 
     def _unwrap_step_limited_deg(A_deg: np.ndarray, step_limit_deg: float = 150.0) -> np.ndarray:
-        """Unwrap each channel using np.unwrap with a custom discontinuity threshold.
+        """Continuity unwrap with hard per-sample step limit in degrees.
 
-        This avoids large ±360° wrap-like jumps while preserving genuine motion.
+        Algorithm (per channel):
+        - Walk forward, at each step adjust by ±360° multiples to minimize jump to previous sample (unwrap).
+        - If the adjusted jump still exceeds 'step_limit_deg', clip it to exactly that bound preserving sign.
+        This guarantees max abs per-sample step <= step_limit_deg.
         """
-        A = np.asarray(A_deg, dtype=np.float32)
+        A = np.asarray(A_deg)
         if A.ndim != 2 or A.shape[0] < 2:
-            return A.copy()
-        out = A.copy().astype(np.float64)
-        discont = np.deg2rad(float(step_limit_deg))
+            return A.astype(np.float32, copy=True)
+        out = A.astype(np.float64).copy()
+        limit = float(step_limit_deg)
+        twoPi = 360.0
         for j in range(out.shape[1]):
-            rad = np.deg2rad(out[:, j])
-            rad_u = np.unwrap(rad, discont=discont)
-            out[:, j] = np.rad2deg(rad_u)
+            prev = float(out[0, j])
+            out[0, j] = prev
+            for i in range(1, out.shape[0]):
+                y = float(out[i, j])
+                # First, choose 360° branch that is closest to prev (unwrap)
+                k = np.round((y - prev) / twoPi)
+                y_adj = y - twoPi * k
+                delta = y_adj - prev
+                # Then, enforce step limit if still exceeded
+                if abs(delta) > limit:
+                    delta = np.sign(delta) * limit
+                    y_adj = prev + delta
+                out[i, j] = y_adj
+                prev = y_adj
         return out.astype(np.float32)
 
     def _pelvis_const_baseline(A_deg: np.ndarray, mask: np.ndarray):
@@ -1234,11 +1376,12 @@ def run_pipeline_clean(
 
     # Angle flexion sign already enforced by enforce_lr_conventions
 
-    # Ensure continuity for joint angles to avoid wrap-like sample jumps (>150 deg)
-    hipL_deg = _unwrap_step_limited_deg(hipL_deg, step_limit_deg=150.0)
-    hipR_deg = _unwrap_step_limited_deg(hipR_deg, step_limit_deg=150.0)
-    kneeL_deg = _unwrap_step_limited_deg(kneeL_deg, step_limit_deg=150.0)
-    kneeR_deg = _unwrap_step_limited_deg(kneeR_deg, step_limit_deg=150.0)
+    # Ensure continuity for joint angles to avoid wrap-like sample jumps
+    # Apply once after baseline path
+    hipL_deg = _unwrap_step_limited_deg(hipL_deg, step_limit_deg=149.9)
+    hipR_deg = _unwrap_step_limited_deg(hipR_deg, step_limit_deg=149.9)
+    kneeL_deg = _unwrap_step_limited_deg(kneeL_deg, step_limit_deg=149.9)
+    kneeR_deg = _unwrap_step_limited_deg(kneeR_deg, step_limit_deg=149.9)
 
     def resample_mean_sd(arr, n=101):
         if len(arr) < 2:

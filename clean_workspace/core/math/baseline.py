@@ -32,13 +32,13 @@ class BaselineConfig:
     def __init__(
         self,
         fs_hz: float,
-        use_yaw_share: bool = True,
+    use_yaw_share: bool = True,
         yaw_share_fc_hz: float = 0.05,  # 0.03–0.05 Hz typical
         stride_debias_axes: tuple[str, ...] = ("Y", "Z"),
-        highpass_fc_hz: float | None = None,  # e.g., 0.02–0.05 Hz or None
-        min_stride_samples: int = 30,
-        allow_stack: bool = False,
-    rewrap_after: bool = False,
+    highpass_fc_hz: float | None = None,  # OFF by default unless set
+    min_stride_samples: int = 30,
+    allow_stack: bool = False,
+    rewrap_after: bool = True,
     ):
         self.fs_hz = float(fs_hz)
         self.use_yaw_share = bool(use_yaw_share)
@@ -144,13 +144,17 @@ def stridewise_debias(
     stride_indices: list[tuple[int, int]],
     axes=(1, 2),
     min_samples: int = 30,
+    extend_across: bool = True,
 ) -> np.ndarray:
-    """Subtract per-stride mean on selected columns. Safeguards short strides.
+    """Subtract per-stride mean on selected columns with optional extension across time.
 
     - X: (T, D) angles in radians (unwrapped)
     - stride_indices: list of (i0, i1) half-open windows
     - axes: tuple of integer column indices to debias (default Y,Z)
     - min_samples: skip windows shorter than this
+    - extend_across: if True (default), build a continuous offset(t) by linear
+      interpolation of per-stride means at stride midpoints, apply across entire time.
+      This eliminates start/stop steps. If False, subtract only within strides.
     """
     A = np.asarray(X, dtype=float)
     if A.ndim == 1:
@@ -160,13 +164,40 @@ def stridewise_debias(
         return out
     D = out.shape[1]
     axes_idx = tuple(i for i in axes if 0 <= int(i) < D)
+    # Collect per-stride means and centers
+    centers: list[int] = []
+    means: list[np.ndarray] = []
     for s, e in stride_indices:
         i0 = max(0, int(s))
         i1 = min(out.shape[0], int(e))
         if i1 - i0 < int(min_samples):
             continue
-        m = np.mean(out[i0:i1, axes_idx], axis=0, keepdims=True)
-        out[i0:i1, axes_idx] -= m
+        m = np.mean(out[i0:i1, axes_idx], axis=0)
+        centers.append(int((i0 + i1) // 2))
+        means.append(m.astype(float))
+    if not centers:
+        return out
+    if extend_across:
+        # Interpolate mean offsets at centers over entire time for each axis
+        T = out.shape[0]
+        centers_arr = np.asarray(centers, dtype=float)
+        M = np.vstack(means)  # (K, len(axes_idx))
+        grid = np.arange(T, dtype=float)
+        off = np.zeros((T, len(axes_idx)), dtype=float)
+        for j in range(len(axes_idx)):
+            off[:, j] = np.interp(grid, centers_arr, M[:, j], left=M[0, j], right=M[-1, j])
+        # Subtract across whole series on selected axes
+        for k, ax in enumerate(axes_idx):
+            out[:, ax] -= off[:, k]
+    else:
+        # Original behavior: subtract inside each stride only
+        for s, e in stride_indices:
+            i0 = max(0, int(s))
+            i1 = min(out.shape[0], int(e))
+            if i1 - i0 < int(min_samples):
+                continue
+            m = np.mean(out[i0:i1, axes_idx], axis=0, keepdims=True)
+            out[i0:i1, axes_idx] -= m
     return out
 
 
@@ -183,6 +214,9 @@ def apply_baseline_correction(
     # optional context for yaw-share if caller provides segment yaw traces
     yaw_pelvis: np.ndarray | None = None,
     yaw_femur: np.ndarray | None = None,
+    # Diagnostic isolation mode: None = normal behavior using cfg;
+    # "none" | "yaw_share_only" | "stride_debias_only" | "highpass_only"
+    mode: str | None = None,
 ) -> np.ndarray:
     """
         Fail-safe pipeline:
@@ -197,14 +231,62 @@ def apply_baseline_correction(
     A = np.asarray(euler_xyz, dtype=float)
     if A.ndim != 2 or A.shape[1] < 1:
         return A.copy()
+
+    # Diagnostic isolation branch
+    if isinstance(mode, str):
+        mode_l = mode.lower().strip()
+        valid = {"none", "yaw_share_only", "stride_debias_only", "highpass_only"}
+        if mode_l not in valid:
+            raise ValueError(f"Invalid mode '{mode}'. Expected one of {sorted(valid)}")
+
+        # Guardrails: don't accidentally stack and don't sneak HP unless requested
+        assert not cfg.allow_stack, "allow_stack must be False for isolation tests"
+        if mode_l != "highpass_only":
+            assert cfg.highpass_fc_hz in (None, 0, 0.0), (
+                "cfg.highpass_fc_hz must be None/0 when not testing highpass_only"
+            )
+
+        Au = unwrap_cols(A)
+
+        if mode_l == "none":
+            out = Au
+        elif mode_l == "stride_debias_only":
+            axes_idx = _axes_to_idx(cfg.stride_debias_axes)
+            out = stridewise_debias(
+                Au,
+                stride_indices or [],
+                axes=axes_idx,
+                min_samples=cfg.min_stride_samples,
+            )
+        elif mode_l == "highpass_only":
+            # Use provided cutoff if positive, else a conservative default
+            fc = None if cfg.highpass_fc_hz is None else float(cfg.highpass_fc_hz)
+            if not (isinstance(fc, (int, float)) and fc > 0):
+                fc = 0.03  # default HP cutoff (Hz)
+            out = highpass(Au, float(cfg.fs_hz), float(fc), order=2)
+        elif mode_l == "yaw_share_only":
+            # Simulate effect on axial (Z) via change in relative yaw trend
+            out = Au.copy()
+            if yaw_pelvis is not None and yaw_femur is not None:
+                yp, yf = np.asarray(yaw_pelvis, dtype=float), np.asarray(yaw_femur, dtype=float)
+                yp_c, yf_c = yaw_share_timevarying(yp, yf, cfg)
+                # delta of relative yaw (femur - pelvis)
+                d_rel = (yf_c - yp_c) - (yf - yp)
+                d_rel = d_rel[: out.shape[0]]
+                if out.shape[1] >= 3 and d_rel.size == out.shape[0]:
+                    out[:, 2] = out[:, 2] + d_rel
+        else:
+            out = Au
+
+        # Always rewrap for diagnostics
+        return wrap_pi(out)
+
+    # Normal behavior (no explicit diagnostic mode): previous fail-safe pipeline
     Au = unwrap_cols(A)
 
     did_share = False
     # Yaw-share (time-varying LF alignment) if explicitly requested and data provided
     if cfg.use_yaw_share and yaw_pelvis is not None and yaw_femur is not None:
-        # We do not overwrite Au here because Au are relative joint angles; yaw-share
-        # should be applied upstream to segment headings. We track that sharing occurred
-        # to avoid stacking debias if not allowed.
         _yp, _yf = yaw_share_timevarying(yaw_pelvis, yaw_femur, cfg)
         did_share = True
 
@@ -223,7 +305,6 @@ def apply_baseline_correction(
     ):
         Au = highpass(Au, cfg.fs_hz, float(cfg.highpass_fc_hz), order=2)
 
-    # Optional rewrap for downstream consumers
     if cfg.rewrap_after:
         Au = wrap_pi(Au)
     return Au
