@@ -26,7 +26,9 @@ def estimate_gyro_bias(gyro_S: np.ndarray, still_mask: np.ndarray | None) -> np.
     return np.mean(g[m], axis=0)
 
 
-def highpass(x: np.ndarray, fs_hz: float, fc_hz: float = 0.03, order: int = 2) -> np.ndarray:
+def highpass(
+    x: np.ndarray, fs_hz: float, fc_hz: float = 0.03, order: int = 2
+) -> np.ndarray:
     """Zero-phase high-pass Butterworth filter for drift removal.
 
     - x can be (T,) or (T,D)
@@ -37,7 +39,7 @@ def highpass(x: np.ndarray, fs_hz: float, fc_hz: float = 0.03, order: int = 2) -
     if fs_hz <= 0 or x.size == 0:
         return x.copy()
     wn = max(1e-4, min(0.99, fc_hz / (0.5 * fs_hz)))
-    sos = butter(order, wn, btype='highpass', output='sos')
+    sos = butter(order, wn, btype="highpass", output="sos")
     if x.ndim == 1:
         return sosfiltfilt(sos, x, axis=0)
     return np.vstack([sosfiltfilt(sos, x[:, i], axis=0) for i in range(x.shape[1])]).T
@@ -46,6 +48,7 @@ def highpass(x: np.ndarray, fs_hz: float, fc_hz: float = 0.03, order: int = 2) -
 def _unwrap_phase(a: np.ndarray) -> np.ndarray:
     """Unwrap angle-like series in radians along axis 0."""
     return np.unwrap(np.asarray(a, dtype=float), axis=0)
+
 
 def apply_yaw_drift_correction(
     yaw_pelvis: np.ndarray,
@@ -77,7 +80,7 @@ def apply_yaw_drift_correction(
         return yp_corr, yf_corr
     # Low-pass each
     wn = max(1e-4, min(0.99, lp_fc_hz / (0.5 * fs_hz)))
-    sos = butter(order, wn, btype='lowpass', output='sos')
+    sos = butter(order, wn, btype="lowpass", output="sos")
     yp_lf = sosfiltfilt(sos, yp, axis=0)
     yf_lf = sosfiltfilt(sos, yf, axis=0)
     shared = (1.0 - alpha) * yp_lf + alpha * yf_lf
@@ -86,7 +89,9 @@ def apply_yaw_drift_correction(
     return yp_corr, yf_corr
 
 
-def stridewise_debias(x: np.ndarray, stride_indices: list[tuple[int,int]], min_samples: int | None = 0) -> np.ndarray:
+def stridewise_debias(
+    x: np.ndarray, stride_indices: list[tuple[int, int]], min_samples: int | None = 0
+) -> np.ndarray:
     """Subtract mean per stride from signal to remove slow drift/bias.
 
     - x: (T,D) or (T,)
@@ -97,6 +102,7 @@ def stridewise_debias(x: np.ndarray, stride_indices: list[tuple[int,int]], min_s
     out = X.copy()
     if X.size == 0 or not stride_indices:
         return out
+
     def _apply_window(i0: int, i1: int):
         if i1 <= i0:
             return
@@ -106,7 +112,9 @@ def stridewise_debias(x: np.ndarray, stride_indices: list[tuple[int,int]], min_s
             out[i0:i1] -= np.mean(out[i0:i1])
         else:
             out[i0:i1] -= np.mean(out[i0:i1], axis=0, keepdims=True)
-    for (s, e) in stride_indices:
-        i0 = max(0, int(s)); i1 = min(out.shape[0], int(e))
+
+    for s, e in stride_indices:
+        i0 = max(0, int(s))
+        i1 = min(out.shape[0], int(e))
         _apply_window(i0, i1)
     return out

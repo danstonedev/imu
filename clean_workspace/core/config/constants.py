@@ -62,3 +62,12 @@ ACC = {
         "acc_z","az","accz"
     ],
 }
+
+# Baseline / drift defaults for angles
+YAW_SHARE_FC_HZ = 0.05
+HP_FC_HZ = None  # set to e.g. 0.03 for drift-prone sensors
+STRIDE_DEBIAS_AXES = ("Y", "Z")
+MIN_STRIDE_SAMPLES = 20
+
+# Twist calibration limits (deg)
+TWIST_CLAMP_DEG = 40.0

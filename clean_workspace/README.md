@@ -59,3 +59,20 @@ git push -u origin main
 - Legacy modules: moved under `core/pipeline/legacy/` with shims for back-compat. Prefer unified_gait for event detection. Existing wrappers:
 	- `core/pipeline/biomech_gait.py` → deprecated shim re-exporting `core/pipeline/legacy/biomech_gait.py`.
 	- `core/pipeline/heel_strike_detection.py` → deprecated wrapper delegating to unified_gait/bilateral utilities.
+
+## Baseline/Drift handling (streamlined)
+
+Angles are computed from relative rotations using intrinsic XYZ Euler with ISB-style axes (X=flex, Y=add, Z=rot). A single baseline module `core/math/baseline.py` applies a consistent, fs-aware post-processing:
+
+- unwrap → optional time-varying yaw sharing (when passing segment yaws) → stride-wise debias on Y/Z → optional high-pass.
+- Filters are Butterworth SOS with cutoffs in Hz.
+- Processing is always on unwrapped angles; re-wrap only for display when needed.
+
+Defaults live in `core/config/constants.py`:
+
+- `YAW_SHARE_FC_HZ = 0.05` (low-pass for LF sharing)
+- `HP_FC_HZ = None` (set to e.g. `0.03` for drift-prone sensors)
+- `STRIDE_DEBIAS_AXES = ("Y","Z")`
+- `MIN_STRIDE_SAMPLES = 20`
+
+In the pipeline, after computing hip/knee Euler angles, stride windows are built from heel strikes and `apply_baseline_correction(...)` is invoked once per joint per side. This centralizes tunables and avoids scattered filters.

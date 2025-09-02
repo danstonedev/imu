@@ -15,7 +15,7 @@ from core.pipeline.pipeline import run_pipeline_clean
 from core.config.settings import settings
 
 root_dir = Path(__file__).resolve().parent
-sample_dir = root_dir / 'sample data'
+sample_dir = root_dir / "sample data"
 
 app = FastAPI(
     title=settings.app_name,
@@ -37,13 +37,17 @@ app.add_middleware(GZipMiddleware, minimum_size=settings.gzip_min_size)
 
 # Restrict Host headers when ALLOWED_HOSTS is set to specific values
 if settings.allowed_hosts and settings.allowed_hosts != ("*",):
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=list(settings.allowed_hosts))
+    app.add_middleware(
+        TrustedHostMiddleware, allowed_hosts=list(settings.allowed_hosts)
+    )
+
 
 def pick(pattern: str) -> str:
     matches = sorted(sample_dir.glob(pattern))
     if not matches:
         raise FileNotFoundError(f"No sample file for pattern: {pattern}")
     return str(matches[0])
+
 
 @app.post("/api/analyze/")
 async def analyze_data(
@@ -80,6 +84,7 @@ async def analyze_data(
     # Quick size guard for bulk payloads to avoid accidental huge uploads (best-effort)
     try:
         max_bytes = int(settings.max_upload_mb) * 1024 * 1024
+
         # Rough check on provided files/zip sizes if available via 'size' attribute or len(content)
         def _approx_size(u: Optional[UploadFile]) -> int:
             try:
@@ -90,8 +95,16 @@ async def analyze_data(
                 return 0
             except Exception:
                 return 0
+
         total_nominal = 0
-        for u in (files or []) + [archive, pelvis_file, lfemur_file, rfemur_file, ltibia_file, rtibia_file]:
+        for u in (files or []) + [
+            archive,
+            pelvis_file,
+            lfemur_file,
+            rfemur_file,
+            ltibia_file,
+            rtibia_file,
+        ]:
             if isinstance(u, list):
                 for x in u:
                     total_nominal += _approx_size(x)
@@ -106,21 +119,25 @@ async def analyze_data(
     # 2) Individually provided 5 fields
     # 3) None provided -> use sample data
     # Treat empty UploadFile placeholders as None to avoid misrouting
-    use_archive = bool(archive and getattr(archive, 'filename', '') )
+    use_archive = bool(archive and getattr(archive, "filename", ""))
     bulk_files = [
-        f for f in (files or [])
-        if f is not None and getattr(f, 'filename', '')
+        f for f in (files or []) if f is not None and getattr(f, "filename", "")
     ]
     indiv_list = [pelvis_file, lfemur_file, rfemur_file, ltibia_file, rtibia_file]
     use_bulk = (len(bulk_files) > 0) and not use_archive
     use_indiv_all = all(f is not None for f in indiv_list)
-    use_none = (not use_archive) and (not use_bulk) and all(f is None for f in indiv_list)
+    use_none = (
+        (not use_archive) and (not use_bulk) and all(f is None for f in indiv_list)
+    )
 
     # Ensure local initialization to avoid any UnboundLocalError on rare paths
     batch_results: List[Dict[str, Any]] = []
 
     if not use_bulk and not use_indiv_all and not use_none:
-        raise HTTPException(status_code=400, detail="Provide either: (a) a folder or multiple files in the 'files' field, (b) all 5 individual files, or (c) none to use sample data.")
+        raise HTTPException(
+            status_code=400,
+            detail="Provide either: (a) a folder or multiple files in the 'files' field, (b) all 5 individual files, or (c) none to use sample data.",
+        )
 
     def idx_from_name(name: str) -> Optional[int]:
         if not isinstance(name, str):
@@ -138,16 +155,24 @@ async def analyze_data(
             return None
         low = name.lower()
         # Heuristics if index pattern isn't present
-        if 'pelvis' in low or 'trunk' in low or 'lumbar' in low:
-            return 'pelvis'
-        if 'lfemur' in low or ('femur' in low and ('left' in low or '_l' in low)):
-            return 'lfemur'
-        if 'rfemur' in low or ('femur' in low and ('right' in low or '_r' in low)):
-            return 'rfemur'
-        if 'ltibia' in low or ('tibia' in low and ('left' in low or '_l' in low)) or 'lshank' in low:
-            return 'ltibia'
-        if 'rtibia' in low or ('tibia' in low and ('right' in low or '_r' in low)) or 'rshank' in low:
-            return 'rtibia'
+        if "pelvis" in low or "trunk" in low or "lumbar" in low:
+            return "pelvis"
+        if "lfemur" in low or ("femur" in low and ("left" in low or "_l" in low)):
+            return "lfemur"
+        if "rfemur" in low or ("femur" in low and ("right" in low or "_r" in low)):
+            return "rfemur"
+        if (
+            "ltibia" in low
+            or ("tibia" in low and ("left" in low or "_l" in low))
+            or "lshank" in low
+        ):
+            return "ltibia"
+        if (
+            "rtibia" in low
+            or ("tibia" in low and ("right" in low or "_r" in low))
+            or "rshank" in low
+        ):
+            return "rtibia"
         return None
 
     def group_key_from_path(name: str) -> str:
@@ -157,8 +182,8 @@ async def analyze_data(
         if not isinstance(name, str) or not name:
             return "dataset"
         # Normalize separators
-        p = name.replace('\\','/')
-        parts = [s for s in p.split('/') if s]
+        p = name.replace("\\", "/")
+        parts = [s for s in p.split("/") if s]
         if len(parts) >= 2:
             # parent folder
             return parts[-2]
@@ -168,13 +193,19 @@ async def analyze_data(
         base = re.sub(r"_\d(?:[_\.]|$)", "", base)
         return base or "dataset"
 
-    def build_datasets_from_uploads(upload_files: List[Any], rel_paths: Optional[List[str]] = None) -> List[Tuple[str, Dict[str, Any]]]:
-        role_by_idx = { 0: "pelvis", 1: "lfemur", 2: "rfemur", 3: "ltibia", 4: "rtibia" }
+    def build_datasets_from_uploads(
+        upload_files: List[Any], rel_paths: Optional[List[str]] = None
+    ) -> List[Tuple[str, Dict[str, Any]]]:
+        role_by_idx = {0: "pelvis", 1: "lfemur", 2: "rfemur", 3: "ltibia", 4: "rtibia"}
         # Group files by dataset key
         groups: Dict[str, List[Any]] = {}
         for i, f in enumerate(upload_files):
             # Prefer client-provided relative path if available (webkitdirectory)
-            rp = rel_paths[i] if (rel_paths and i < len(rel_paths)) else getattr(f, 'filename', '')
+            rp = (
+                rel_paths[i]
+                if (rel_paths and i < len(rel_paths))
+                else getattr(f, "filename", "")
+            )
             key = group_key_from_path(rp)
             groups.setdefault(key, []).append(f)
         datasets: List[Tuple[str, Dict[str, Any]]] = []
@@ -183,7 +214,7 @@ async def analyze_data(
             seen_idx: set[int] = set()
             # Pass 1: index-based mapping
             for f in files_in_group:
-                idx = idx_from_name(getattr(f, 'filename', ''))
+                idx = idx_from_name(getattr(f, "filename", ""))
                 if idx is None or idx not in role_by_idx:
                     continue
                 if idx in seen_idx:
@@ -192,10 +223,12 @@ async def analyze_data(
                 detected[role_by_idx[idx]] = f
             # Pass 2: fill gaps via keywords
             if len(detected) < 5:
-                missing = { r for r in role_by_idx.values() if r not in detected }
+                missing = {r for r in role_by_idx.values() if r not in detected}
                 if missing:
-                    for f in sorted(files_in_group, key=lambda x: getattr(x, 'filename', '')):
-                        role = role_from_keywords(getattr(f, 'filename', ''))
+                    for f in sorted(
+                        files_in_group, key=lambda x: getattr(x, "filename", "")
+                    ):
+                        role = role_from_keywords(getattr(f, "filename", ""))
                         if role and role in missing and role not in detected:
                             detected[role] = f
                             missing.remove(role)
@@ -208,85 +241,142 @@ async def analyze_data(
     if use_archive:
         # Unpack zip and build datasets from contained CSVs
         arc = archive  # local non-optional alias for type checkers
-        fn = (getattr(arc, 'filename', '') or '') if arc is not None else ''
+        fn = (getattr(arc, "filename", "") or "") if arc is not None else ""
         if arc is None or not fn:
             raise HTTPException(status_code=400, detail="Archive must be a .zip file")
-        if not fn.lower().endswith('.zip'):
+        if not fn.lower().endswith(".zip"):
             raise HTTPException(status_code=400, detail="Archive must be a .zip file")
         data_bytes = await arc.read()
         if len(data_bytes) > int(settings.max_upload_mb) * 1024 * 1024:
-            raise HTTPException(status_code=413, detail=f"Archive exceeds limit of {settings.max_upload_mb} MB")
+            raise HTTPException(
+                status_code=413,
+                detail=f"Archive exceeds limit of {settings.max_upload_mb} MB",
+            )
         try:
             zf = zipfile.ZipFile(io.BytesIO(data_bytes))
         except zipfile.BadZipFile:
             raise HTTPException(status_code=400, detail="Invalid zip archive")
         # Collect pseudo UploadFiles from zip entries
         file_objs: List[Any] = []
-        csv_infos = [zi for zi in zf.infolist() if not zi.is_dir() and zi.filename.lower().endswith('.csv')]
+        csv_infos = [
+            zi
+            for zi in zf.infolist()
+            if not zi.is_dir() and zi.filename.lower().endswith(".csv")
+        ]
+
         # Materialize as simple objects with .filename and .read()
         class ZipUP:
             def __init__(self, name: str, data: bytes):
                 self.filename = name
                 self._data = data
+
             async def read(self):
                 return self._data
+
         for zi in csv_infos:
             try:
-                with zf.open(zi, 'r') as fh:
+                with zf.open(zi, "r") as fh:
                     file_objs.append(ZipUP(zi.filename, fh.read()))
             except Exception:
                 continue
         # Build datasets
         ds = build_datasets_from_uploads(file_objs) if file_objs else []
         if not ds:
-            raise HTTPException(status_code=400, detail="No valid datasets found in zip. Expect subfolders each containing 5 CSVs (pelvis/lfemur/rfemur/ltibia/rtibia). Filenames should include indices _0.._4 or role keywords.")
+            raise HTTPException(
+                status_code=400,
+                detail="No valid datasets found in zip. Expect subfolders each containing 5 CSVs (pelvis/lfemur/rfemur/ltibia/rtibia). Filenames should include indices _0.._4 or role keywords.",
+            )
         batch_results = []
-        options: dict = {'do_cal': True, 'yaw_align': True}
-        if isinstance(baseline_mode, str) and baseline_mode in {"none","constant","linear"}:
-            options['baseline_mode'] = baseline_mode
-        if isinstance(cal_mode, str) and cal_mode in {"simple","advanced"}:
-            options['cal_mode'] = cal_mode
+        options: dict = {
+            "do_cal": True,
+            "yaw_align": True,
+            "yaw_share": {"enabled": False},
+        }
+        if isinstance(baseline_mode, str) and baseline_mode in {
+            "none",
+            "constant",
+            "linear",
+        }:
+            options["baseline_mode"] = baseline_mode
+        if isinstance(cal_mode, str) and cal_mode in {"simple", "advanced"}:
+            options["cal_mode"] = cal_mode
         for key, mapping in ds:
-            files_bytes = { role: (await mapping[role].read()) for role in ["pelvis","lfemur","rfemur","ltibia","rtibia"] }
+            files_bytes = {
+                role: (await mapping[role].read())
+                for role in ["pelvis", "lfemur", "rfemur", "ltibia", "rtibia"]
+            }
             res = run_pipeline_clean(files_bytes, height_m, mass_kg, options)
             # Attach meta source name
             if isinstance(res, dict):
-                res.setdefault('meta', {})
-                res['meta']['dataset'] = key
-                res['meta']['baseline_mode'] = (baseline_mode if baseline_mode in {"none","constant","linear"} else 'linear')
-            batch_results.append({ 'name': key, 'results': res })
+                res.setdefault("meta", {})
+                res["meta"]["dataset"] = key
+                res["meta"]["baseline_mode"] = (
+                    baseline_mode
+                    if baseline_mode in {"none", "constant", "linear"}
+                    else "linear"
+                )
+            batch_results.append({"name": key, "results": res})
         # Convert to JSON-friendly (archive returns batch)
-        return JSONResponse(content={'batch': to_json_safe(batch_results)})
+        return JSONResponse(content={"batch": to_json_safe(batch_results)})
 
     if use_bulk:
         # Try autodetect mapping from a mixed list of files
         datasets = build_datasets_from_uploads(bulk_files, paths or None)
         if not datasets:
-            raise HTTPException(status_code=400, detail="Could not identify datasets from uploaded files. Ensure each test is in its own folder (or filenames include indices _0.._4) with all 5 CSVs.")
+            raise HTTPException(
+                status_code=400,
+                detail="Could not identify datasets from uploaded files. Ensure each test is in its own folder (or filenames include indices _0.._4) with all 5 CSVs.",
+            )
         # If multiple datasets, return batch; if single, continue with single result behavior
         if len(datasets) > 1:
             batch_results = []
-            options: dict = {'do_cal': True, 'yaw_align': True}
-            if isinstance(baseline_mode, str) and baseline_mode in {"none","constant","linear"}:
-                options['baseline_mode'] = baseline_mode
-            if isinstance(cal_mode, str) and cal_mode in {"simple","advanced"}:
-                options['cal_mode'] = cal_mode
+            options: dict = {
+                "do_cal": True,
+                "yaw_align": True,
+                "yaw_share": {"enabled": False},
+            }
+            if isinstance(baseline_mode, str) and baseline_mode in {
+                "none",
+                "constant",
+                "linear",
+            }:
+                options["baseline_mode"] = baseline_mode
+            if isinstance(cal_mode, str) and cal_mode in {"simple", "advanced"}:
+                options["cal_mode"] = cal_mode
             for key, mapping in datasets:
-                files_bytes = { role: (await mapping[role].read()) for role in ["pelvis","lfemur","rfemur","ltibia","rtibia"] }
+                files_bytes = {
+                    role: (await mapping[role].read())
+                    for role in ["pelvis", "lfemur", "rfemur", "ltibia", "rtibia"]
+                }
                 res = run_pipeline_clean(files_bytes, height_m, mass_kg, options)
                 if isinstance(res, dict):
-                    res.setdefault('meta', {})
-                    res['meta']['dataset'] = key
-                    res['meta']['baseline_mode'] = (baseline_mode if baseline_mode in {"none","constant","linear"} else 'linear')
-                batch_results.append({ 'name': key, 'results': res })
-            return JSONResponse(content={'batch': to_json_safe(batch_results)})
+                    res.setdefault("meta", {})
+                    res["meta"]["dataset"] = key
+                    res["meta"]["baseline_mode"] = (
+                        baseline_mode
+                        if baseline_mode in {"none", "constant", "linear"}
+                        else "linear"
+                    )
+                batch_results.append({"name": key, "results": res})
+            return JSONResponse(content={"batch": to_json_safe(batch_results)})
         # Single dataset
         key, mapping = datasets[0]
-        files_bytes = { role: await mapping[role].read() for role in ["pelvis","lfemur","rfemur","ltibia","rtibia"] }
+        files_bytes = {
+            role: await mapping[role].read()
+            for role in ["pelvis", "lfemur", "rfemur", "ltibia", "rtibia"]
+        }
     elif use_indiv_all:
         # Verify all files are present and create non-nullable references
-        if pelvis_file is None or lfemur_file is None or rfemur_file is None or ltibia_file is None or rtibia_file is None:
-            raise HTTPException(status_code=400, detail="All 5 files must be provided when uploading.")
+        if (
+            pelvis_file is None
+            or lfemur_file is None
+            or rfemur_file is None
+            or ltibia_file is None
+            or rtibia_file is None
+        ):
+            raise HTTPException(
+                status_code=400, detail="All 5 files must be provided when uploading."
+            )
         # Autodetect roles from filename pattern across the five individual file fields
         uploads = [
             ("pelvis", pelvis_file),
@@ -295,11 +385,11 @@ async def analyze_data(
             ("ltibia", ltibia_file),
             ("rtibia", rtibia_file),
         ]
-        role_by_idx = { 0: "pelvis", 1: "lfemur", 2: "rfemur", 3: "ltibia", 4: "rtibia" }
+        role_by_idx = {0: "pelvis", 1: "lfemur", 2: "rfemur", 3: "ltibia", 4: "rtibia"}
         detected: dict[str, UploadFile] = {}
         all_idxs: set[int] = set()
         for _, f in uploads:
-            idx = idx_from_name(getattr(f, 'filename', ''))
+            idx = idx_from_name(getattr(f, "filename", ""))
             if idx is None or idx not in role_by_idx:
                 detected = {}
                 break
@@ -310,7 +400,7 @@ async def analyze_data(
             detected[role_by_idx[idx]] = f
 
         if detected and len(detected) == 5:
-            files_bytes = { role: await f.read() for role, f in detected.items() }
+            files_bytes = {role: await f.read() for role, f in detected.items()}
         else:
             # Fallback: trust form field mapping
             files_bytes = {
@@ -323,53 +413,66 @@ async def analyze_data(
     else:
         # Fallback to sample data from disk (bytes)
         sample_paths = {
-            'pelvis': pick('DEMO6_0_*.csv'),
-            'lfemur': pick('DEMO6_1_*.csv'),
-            'rfemur': pick('DEMO6_2_*.csv'),
-            'ltibia': pick('DEMO6_3_*.csv'),
-            'rtibia': pick('DEMO6_4_*.csv'),
+            "pelvis": pick("DEMO6_0_*.csv"),
+            "lfemur": pick("DEMO6_1_*.csv"),
+            "rfemur": pick("DEMO6_2_*.csv"),
+            "ltibia": pick("DEMO6_3_*.csv"),
+            "rtibia": pick("DEMO6_4_*.csv"),
         }
         files_bytes = {k: Path(v).read_bytes() for k, v in sample_paths.items()}
 
-    options: dict = {'do_cal': True, 'yaw_align': True}
-    if isinstance(baseline_mode, str) and baseline_mode in {"none","constant","linear"}:
-        options['baseline_mode'] = baseline_mode
-    if isinstance(cal_mode, str) and cal_mode in {"simple","advanced"}:
-        options['cal_mode'] = cal_mode
+    options: dict = {"do_cal": True, "yaw_align": True, "yaw_share": {"enabled": False}}
+    if isinstance(baseline_mode, str) and baseline_mode in {
+        "none",
+        "constant",
+        "linear",
+    }:
+        options["baseline_mode"] = baseline_mode
+    if isinstance(cal_mode, str) and cal_mode in {"simple", "advanced"}:
+        options["cal_mode"] = cal_mode
     results = run_pipeline_clean(files_bytes, height_m, mass_kg, options)
     # Attach simple meta for UI
     try:
-        meta = results.get('meta', {}) if isinstance(results, dict) else {}
-        meta['baseline_mode'] = (baseline_mode if baseline_mode in {"none","constant","linear"} else 'linear')
+        meta = results.get("meta", {}) if isinstance(results, dict) else {}
+        meta["baseline_mode"] = (
+            baseline_mode
+            if baseline_mode in {"none", "constant", "linear"}
+            else "linear"
+        )
         if isinstance(results, dict):
-            results['meta'] = meta
+            results["meta"] = meta
     except Exception:
         pass
 
     return JSONResponse(content=to_json_safe(results))
 
+
 @app.get("/")
 async def read_index():
-    index = root_dir / 'static' / 'index.html'
+    index = root_dir / "static" / "index.html"
     if index.exists():
         return FileResponse(str(index))
     return JSONResponse({"status": "ok", "app": settings.app_name})
 
-@app.get('/favicon.ico')
+
+@app.get("/favicon.ico")
 async def favicon():
-    fav = root_dir / 'static' / 'favicon.ico'
+    fav = root_dir / "static" / "favicon.ico"
     if fav.exists():
         return FileResponse(str(fav))
     raise HTTPException(status_code=404, detail="favicon not found")
 
-app.mount("/static", StaticFiles(directory=str(root_dir / 'static')), name="static")
+
+app.mount("/static", StaticFiles(directory=str(root_dir / "static")), name="static")
+
 
 # Quiet Chrome/Edge DevTools probes (prevent 404 spam in logs)
 @app.get("/.well-known/appspecific/com.chrome.devtools.json")
 async def chrome_devtools_probe():
     return Response(status_code=204)
 
+
 # Simple health check endpoint for local probes
 @app.get("/health")
 async def health():
-    return JSONResponse({"status":"ok"})
+    return JSONResponse({"status": "ok"})
