@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual envs
+.venv/
+venv/
+ENV/
+
+# Pytest
+.pytest_cache/
+
+# VS Code / IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Generated analysis outputs
+clean_workspace/analysis_out/
+
+# Bytecode caches
+clean_workspace/**/__pycache__/
+
+# Compiled Python
+*.cpython-*.pyc
+*.pyc
+
+# Jupyter
+.ipynb_checkpoints/

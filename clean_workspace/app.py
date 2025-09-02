@@ -6,23 +6,38 @@ import io
 import zipfile
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 import numpy as np
 from core.pipeline.pipeline import run_pipeline_clean
+from core.config.settings import settings
 
 root_dir = Path(__file__).resolve().parent
 sample_dir = root_dir / 'sample data'
 
-app = FastAPI(title="Hip Torque Analysis API")
+app = FastAPI(
+    title=settings.app_name,
+    docs_url=("/docs" if settings.docs_enabled else None),
+    redoc_url=("/redoc" if settings.docs_enabled else None),
+    openapi_url=("/openapi.json" if settings.openapi_enabled else None),
+)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=list(settings.allowed_origins),
+    allow_credentials=settings.allow_credentials,
+    allow_methods=list(settings.allowed_methods),
+    allow_headers=list(settings.allowed_headers),
 )
+
+# Compression for large JSON responses and CSV strings
+app.add_middleware(GZipMiddleware, minimum_size=settings.gzip_min_size)
+
+# Restrict Host headers when ALLOWED_HOSTS is set to specific values
+if settings.allowed_hosts and settings.allowed_hosts != ("*",):
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=list(settings.allowed_hosts))
 
 def pick(pattern: str) -> str:
     matches = sorted(sample_dir.glob(pattern))
@@ -35,6 +50,7 @@ async def analyze_data(
     height_m: float = Form(...),
     mass_kg: float = Form(...),
     baseline_mode: Optional[str] = Form(None),
+    cal_mode: Optional[str] = Form(None),
     # New: accept a single .zip containing multiple tests (nested folders ok)
     archive: Optional[UploadFile] = File(None),
     # New: support bulk upload of files (multiple or a selected folder)
@@ -60,6 +76,30 @@ async def analyze_data(
         if isinstance(obj, (list, tuple)):
             return [to_json_safe(x) for x in obj]
         return obj
+
+    # Quick size guard for bulk payloads to avoid accidental huge uploads (best-effort)
+    try:
+        max_bytes = int(settings.max_upload_mb) * 1024 * 1024
+        # Rough check on provided files/zip sizes if available via 'size' attribute or len(content)
+        def _approx_size(u: Optional[UploadFile]) -> int:
+            try:
+                if u is None:
+                    return 0
+                # starlette UploadFile exposes spooled file; size isn't directly available
+                # We avoid reading here to keep streaming behavior; rely on archive path below
+                return 0
+            except Exception:
+                return 0
+        total_nominal = 0
+        for u in (files or []) + [archive, pelvis_file, lfemur_file, rfemur_file, ltibia_file, rtibia_file]:
+            if isinstance(u, list):
+                for x in u:
+                    total_nominal += _approx_size(x)
+            else:
+                total_nominal += _approx_size(u)
+        # Only enforce for archive after read where we know bytes
+    except Exception:
+        pass
 
     # Determine upload mode:
     # 1) Bulk files provided via `files`
@@ -174,6 +214,8 @@ async def analyze_data(
         if not fn.lower().endswith('.zip'):
             raise HTTPException(status_code=400, detail="Archive must be a .zip file")
         data_bytes = await arc.read()
+        if len(data_bytes) > int(settings.max_upload_mb) * 1024 * 1024:
+            raise HTTPException(status_code=413, detail=f"Archive exceeds limit of {settings.max_upload_mb} MB")
         try:
             zf = zipfile.ZipFile(io.BytesIO(data_bytes))
         except zipfile.BadZipFile:
@@ -202,6 +244,8 @@ async def analyze_data(
         options: dict = {'do_cal': True, 'yaw_align': True}
         if isinstance(baseline_mode, str) and baseline_mode in {"none","constant","linear"}:
             options['baseline_mode'] = baseline_mode
+        if isinstance(cal_mode, str) and cal_mode in {"simple","advanced"}:
+            options['cal_mode'] = cal_mode
         for key, mapping in ds:
             files_bytes = { role: (await mapping[role].read()) for role in ["pelvis","lfemur","rfemur","ltibia","rtibia"] }
             res = run_pipeline_clean(files_bytes, height_m, mass_kg, options)
@@ -225,6 +269,8 @@ async def analyze_data(
             options: dict = {'do_cal': True, 'yaw_align': True}
             if isinstance(baseline_mode, str) and baseline_mode in {"none","constant","linear"}:
                 options['baseline_mode'] = baseline_mode
+            if isinstance(cal_mode, str) and cal_mode in {"simple","advanced"}:
+                options['cal_mode'] = cal_mode
             for key, mapping in datasets:
                 files_bytes = { role: (await mapping[role].read()) for role in ["pelvis","lfemur","rfemur","ltibia","rtibia"] }
                 res = run_pipeline_clean(files_bytes, height_m, mass_kg, options)
@@ -288,6 +334,8 @@ async def analyze_data(
     options: dict = {'do_cal': True, 'yaw_align': True}
     if isinstance(baseline_mode, str) and baseline_mode in {"none","constant","linear"}:
         options['baseline_mode'] = baseline_mode
+    if isinstance(cal_mode, str) and cal_mode in {"simple","advanced"}:
+        options['cal_mode'] = cal_mode
     results = run_pipeline_clean(files_bytes, height_m, mass_kg, options)
     # Attach simple meta for UI
     try:
@@ -302,7 +350,10 @@ async def analyze_data(
 
 @app.get("/")
 async def read_index():
-    return FileResponse(str(root_dir / 'static' / 'index.html'))
+    index = root_dir / 'static' / 'index.html'
+    if index.exists():
+        return FileResponse(str(index))
+    return JSONResponse({"status": "ok", "app": settings.app_name})
 
 @app.get('/favicon.ico')
 async def favicon():

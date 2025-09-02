@@ -8,6 +8,7 @@ from __future__ import annotations
 import numpy as np
 from scipy.signal import butter, sosfiltfilt, find_peaks, correlate
 from typing import Tuple, Dict, Any, Optional
+from .stance_cycles import composite_stance, contacts_from_stance
 from ..config.constants import CYCLE_N, CYCLE_DROP_FIRST, CYCLE_DROP_LAST, CYCLE_MIN_DUR_S, CYCLE_MAX_DUR_S
 
 __all__ = ["detect_gait_cycles", "gait_cycle_analysis"]
@@ -160,6 +161,15 @@ def detect_heel_strikes_biomech(
     
     return np.array(confirmed_hs, dtype=int)
 
+def _fs_from_time(t: np.ndarray) -> float:
+    t = np.asarray(t, dtype=float)
+    if t is None or t.size < 2:
+        return float('nan')
+    dt = np.diff(t)
+    dt = dt[np.isfinite(dt) & (dt > 0)]
+    return float(1.0 / np.median(dt)) if dt.size else float('nan')
+
+
 def detect_gait_cycles(*args, **kwargs) -> Dict[str, Any]:
     """
     Unified gait cycle detection using biomechanical heel strike detection
@@ -191,35 +201,263 @@ def detect_gait_cycles(*args, **kwargs) -> Dict[str, Any]:
         else:
             raise TypeError("detect_gait_cycles called with unsupported arguments")
 
-    # Low-fs safeguards for filter settings
+    # Optional behavior flags (defaults keep current behavior)
+    allow_snap = bool(kwargs.get('allow_snap', True))
+    allow_stance_replace = bool(kwargs.get('allow_stance_replace', True))
+    allow_synthesis = bool(kwargs.get('allow_synthesis', True))
+    # Tolerances
+    snap_tol_pre_ms = float(kwargs.get('snap_tol_pre_ms', 120.0))
+    snap_tol_post_ms = float(kwargs.get('snap_tol_post_ms', 200.0))
+    min_step_s_replace = float(kwargs.get('min_step_s_replace', 0.35))
+    min_step_s_synth = float(kwargs.get('min_step_s_synth', 0.35))
+
+    # Determine per-side sampling frequencies from time arrays if available
+    fs_left = _fs_from_time(t_left)
+    fs_right = _fs_from_time(t_right)
+    # If explicit fs provided and valid, use it where per-side estimate is NaN
+    if 'fs' in kwargs or (len(args) in (6,7)):
+        try:
+            fs_global = float(kwargs.get('fs', fs))
+        except Exception:
+            fs_global = float('nan')
+    else:
+        fs_global = float('nan')
+    if not np.isfinite(fs_left):
+        fs_left = fs_global
+    if not np.isfinite(fs_right):
+        fs_right = fs_global
+    # As a last resort, fall back to 100 Hz
+    if not np.isfinite(fs_left):
+        fs_left = 100.0
+    if not np.isfinite(fs_right):
+        fs_right = 100.0
+
+    # Low-fs safeguards for filter settings (per-side)
     # Default bands
     vib_band_default = (8.0, 25.0)
     gyro_lpf_default = 10.0
-    vib_band_used = list(vib_band_default)
-    gyro_lpf_used = float(gyro_lpf_default)
-    filter_adjustments: Dict[str, Any] = {}
-    if fs < 25.0:
-        # Narrow band for impact and reduce gyro LPF at low sampling rates
-        vib_band_used = [4.0, min(10.0, max(5.0, fs/2.0 - max(0.5, 0.05*fs)))]
-        gyro_lpf_used = min(6.0, max(2.0, fs/4.0))
-        filter_adjustments = {
-            'reason': 'low_fs',
-            'fs': float(fs),
-            'vib_band': tuple(vib_band_used),
-            'gyro_lpf': float(gyro_lpf_used),
-        }
+    def _bands(fs_val: float) -> Tuple[Tuple[float,float], float, Dict[str,Any]]:
+        vib_band_used = list(vib_band_default)
+        gyro_lpf_used = float(gyro_lpf_default)
+        adj: Dict[str, Any] = {}
+        if fs_val < 25.0:
+            vib_band_used = [4.0, min(10.0, max(5.0, fs_val/2.0 - max(0.5, 0.05*fs_val)))]
+            gyro_lpf_used = min(6.0, max(2.0, fs_val/4.0))
+            adj = {
+                'reason': 'low_fs',
+                'fs': float(fs_val),
+                'vib_band': (float(vib_band_used[0]), float(vib_band_used[1])),
+                'gyro_lpf': float(gyro_lpf_used),
+            }
+        return (float(vib_band_used[0]), float(vib_band_used[1])), float(gyro_lpf_used), adj
+    vib_band_L, gyro_lpf_L, adj_L = _bands(fs_left)
+    vib_band_R, gyro_lpf_R, adj_R = _bands(fs_right)
 
     # Detect heel strikes for both legs
-    vib_band_tuple: Tuple[float, float] = (float(vib_band_used[0]), float(vib_band_used[1]))
-    hs_left = detect_heel_strikes_biomech(t_left, accel_left, gyro_left, fs, vib_band=vib_band_tuple, gyro_lpf=float(gyro_lpf_used))
-    hs_right = detect_heel_strikes_biomech(t_right, accel_right, gyro_right, fs, vib_band=vib_band_tuple, gyro_lpf=float(gyro_lpf_used))
+    hs_left = detect_heel_strikes_biomech(t_left, accel_left, gyro_left, fs_left, vib_band=vib_band_L, gyro_lpf=float(gyro_lpf_L))
+    hs_right = detect_heel_strikes_biomech(t_right, accel_right, gyro_right, fs_right, vib_band=vib_band_R, gyro_lpf=float(gyro_lpf_R))
+
+    # Optional stance gating: snap HS to nearest stance onset and drop outliers
+    try:
+        stance_L = composite_stance(gyro_left, accel_left)
+        stance_R = composite_stance(gyro_right, accel_right)
+        onsets_L = contacts_from_stance(stance_L)
+        onsets_R = contacts_from_stance(stance_R)
+        def _snap_to_onsets(hs_idx: np.ndarray, onsets: np.ndarray, fs_val: float) -> np.ndarray:
+            if not allow_snap or hs_idx.size == 0 or onsets.size == 0:
+                return hs_idx
+            tol_pre = int((snap_tol_pre_ms/1000.0) * fs_val)
+            tol_post = int((snap_tol_post_ms/1000.0) * fs_val)
+            snapped = []
+            j = 0
+            for h in hs_idx:
+                while j < len(onsets) and onsets[j] < (h - tol_pre):
+                    j += 1
+                cand = []
+                for k in (j-1, j):
+                    if 0 <= k < len(onsets):
+                        o = int(onsets[k])
+                        if (o >= h - tol_pre) and (o <= h + tol_post):
+                            cand.append(o)
+                snapped.append(int(min(cand, key=lambda o: abs(o - h))) if cand else int(h))
+            out = np.unique(np.asarray(snapped, dtype=int))
+            return out
+        snapped_left = _snap_to_onsets(hs_left, onsets_L, fs_left)
+        snapped_right = _snap_to_onsets(hs_right, onsets_R, fs_right)
+        snap_applied_left = bool(allow_snap and snapped_left.size == hs_left.size and not np.array_equal(snapped_left, hs_left))
+        snap_applied_right = bool(allow_snap and snapped_right.size == hs_right.size and not np.array_equal(snapped_right, hs_right))
+        hs_left, hs_right = snapped_left, snapped_right
+
+        # Fallback: if one side is clearly sparse vs the other, prefer stance onsets
+        def _maybe_replace_with_onsets(hs_idx: np.ndarray, onsets: np.ndarray, other_count: int, fs_val: float) -> np.ndarray:
+            if not allow_stance_replace or onsets is None or onsets.size == 0:
+                return hs_idx
+            c = int(hs_idx.size)
+            # Trigger when fewer than half of the other side or < 6 total events
+            if (other_count > 0 and c < max(6, int(0.5 * other_count))):
+                # Enforce minimum step time spacing based on fs
+                if onsets.size > 1:
+                    dt_min = int(max(min_step_s_replace * fs_val, 1))
+                    pruned = [int(onsets[0])]
+                    for k in onsets[1:]:
+                        if int(k) - pruned[-1] >= dt_min:
+                            pruned.append(int(k))
+                    return np.asarray(pruned, dtype=int)
+                return np.asarray(onsets, dtype=int)
+            return hs_idx
+
+        replaced_left_before = int(hs_left.size)
+        replaced_right_before = int(hs_right.size)
+        hs_left = _maybe_replace_with_onsets(hs_left, onsets_L, int(hs_right.size), fs_left)
+        hs_right = _maybe_replace_with_onsets(hs_right, onsets_R, int(hs_left.size), fs_right)
+        replaced_with_onsets_left = bool(allow_stance_replace and int(hs_left.size) > replaced_left_before)
+        replaced_with_onsets_right = bool(allow_stance_replace and int(hs_right.size) > replaced_right_before)
+
+        # Bilateral alternation fallback: if counts differ by >20%, synthesize sparse side
+        def _hs_times(t_arr: np.ndarray, idx: np.ndarray) -> np.ndarray:
+            if idx is None or idx.size == 0:
+                return np.array([], dtype=float)
+            idx = idx[(idx >= 0) & (idx < len(t_arr))]
+            return t_arr[idx]
+
+        def _synthesize_from_other(ref_times: np.ndarray, t_src: np.ndarray, fs_val: float) -> np.ndarray:
+            if ref_times.size < 3:
+                return np.array([], dtype=int)
+            stride = np.diff(ref_times)
+            stride = stride[np.isfinite(stride) & (stride > 0.25) & (stride < 3.0)]
+            if stride.size == 0:
+                return np.array([], dtype=int)
+            half = float(np.median(stride)) * 0.5
+            # Candidates midway between ref HS
+            cand = ref_times[:-1] + half
+            # Map to indices on target time axis
+            idx = np.searchsorted(t_src, cand, side='left')
+            idx = idx[(idx >= 0) & (idx < len(t_src))]
+            # Enforce min step separation
+            min_sep = int(max(0.35 * fs_val, 1))
+            out = []
+            for k in idx:
+                if not out or (k - out[-1]) >= min_sep:
+                    out.append(int(k))
+            return np.asarray(out, dtype=int)
+
+        cL, cR = int(hs_left.size), int(hs_right.size)
+        synthesized_left = False
+        synthesized_right = False
+        if allow_synthesis and max(cL, cR) > 0 and abs(cL - cR) > 0.2 * max(cL, cR):
+            if cL > cR:
+                timesL = _hs_times(t_left, hs_left)
+                # Use synthesis min step
+                orig_min_step = min_step_s_synth
+                def _synthesize_from_other_ref(ref_times, t_src, fs_val):
+                    if ref_times.size < 3:
+                        return np.array([], dtype=int)
+                    stride = np.diff(ref_times)
+                    stride = stride[np.isfinite(stride) & (stride > 0.25) & (stride < 3.0)]
+                    if stride.size == 0:
+                        return np.array([], dtype=int)
+                    half = float(np.median(stride)) * 0.5
+                    cand = ref_times[:-1] + half
+                    idx = np.searchsorted(t_src, cand, side='left')
+                    idx = idx[(idx >= 0) & (idx < len(t_src))]
+                    min_sep = int(max(orig_min_step * fs_val, 1))
+                    out = []
+                    for k in idx:
+                        if not out or (k - out[-1]) >= min_sep:
+                            out.append(int(k))
+                    return np.asarray(out, dtype=int)
+                synth_R = _synthesize_from_other_ref(timesL, t_right, fs_right)
+                if synth_R.size and abs(int(synth_R.size) - cL) <= abs(cR - cL):
+                    hs_right = synth_R
+                    synthesized_right = True
+            else:
+                timesR = _hs_times(t_right, hs_right)
+                def _synthesize_from_other_ref(ref_times, t_src, fs_val):
+                    if ref_times.size < 3:
+                        return np.array([], dtype=int)
+                    stride = np.diff(ref_times)
+                    stride = stride[np.isfinite(stride) & (stride > 0.25) & (stride < 3.0)]
+                    if stride.size == 0:
+                        return np.array([], dtype=int)
+                    half = float(np.median(stride)) * 0.5
+                    cand = ref_times[:-1] + half
+                    idx = np.searchsorted(t_src, cand, side='left')
+                    idx = idx[(idx >= 0) & (idx < len(t_src))]
+                    min_sep = int(max(min_step_s_synth * fs_val, 1))
+                    out = []
+                    for k in idx:
+                        if not out or (k - out[-1]) >= min_sep:
+                            out.append(int(k))
+                    return np.asarray(out, dtype=int)
+                synth_L = _synthesize_from_other_ref(timesR, t_left, fs_left)
+                if synth_L.size and abs(int(synth_L.size) - cR) <= abs(cL - cR):
+                    hs_left = synth_L
+                    synthesized_left = True
+    except Exception:
+        pass
 
     # Detect toe-offs based on heel strikes
-    to_left = detect_toe_offs_biomech(t_left, accel_left, gyro_left, hs_left, fs)
-    to_right = detect_toe_offs_biomech(t_right, accel_right, gyro_right, hs_right, fs)
+    to_left = detect_toe_offs_biomech(t_left, accel_left, gyro_left, hs_left, fs_left)
+    to_right = detect_toe_offs_biomech(t_right, accel_right, gyro_right, hs_right, fs_right)
 
     # Assess bilateral coordination
     coordination = assess_bilateral_coordination(hs_left, t_left, hs_right, t_right)
+
+    # Backward-compatible metadata flattening
+    # Global sampling frequency prefers provided fs; fall back to left-side estimate
+    if np.isfinite(fs_global):
+        sampling_frequency_flat = float(fs_global)
+    else:
+        sampling_frequency_flat = float(fs_left)
+
+    # Choose representative detector params for flat view (use left side)
+    detector_params_flat = {
+        'vib_band_used': vib_band_L,
+        'gyro_lpf_used': float(gyro_lpf_L),
+    }
+
+    # Flatten filter adjustments when both sides match or using left as representative
+    filter_adjustments_flat: Dict[str, Any] = {}
+    if adj_L and isinstance(adj_L, dict):
+        filter_adjustments_flat = dict(adj_L)
+    # If both sides exist but differ, include per-side details separately
+    per_side_params = {
+        'left': {'vib_band_used': vib_band_L, 'gyro_lpf_used': float(gyro_lpf_L)},
+        'right': {'vib_band_used': vib_band_R, 'gyro_lpf_used': float(gyro_lpf_R)}
+    }
+    per_side_adjustments = {'left': adj_L, 'right': adj_R}
+
+    # Event quality metrics
+    def _cadence_spm(hs_idx: np.ndarray, t_arr: np.ndarray) -> float:
+        if hs_idx is None or hs_idx.size < 2:
+            return 0.0
+        times = t_arr[hs_idx]
+        dt = np.diff(times)
+        dt = dt[np.isfinite(dt) & (dt > 0.2)]
+        if dt.size == 0:
+            return 0.0
+        stride_s = float(np.median(dt))
+        return float(60.0 / stride_s)
+
+    event_quality = {
+        'left': {
+            'hs_count': int(hs_left.size),
+            'to_count': int(to_left.size),
+            'cadence_spm': _cadence_spm(hs_left, t_left),
+        },
+        'right': {
+            'hs_count': int(hs_right.size),
+            'to_count': int(to_right.size),
+            'cadence_spm': _cadence_spm(hs_right, t_right),
+        },
+        'adjustments': {
+            'snap': {'left': bool('snap_applied_left' in locals() and snap_applied_left),
+                     'right': bool('snap_applied_right' in locals() and snap_applied_right)},
+            'replacement_with_onsets': {'left': bool('replaced_with_onsets_left' in locals() and replaced_with_onsets_left),
+                                        'right': bool('replaced_with_onsets_right' in locals() and replaced_with_onsets_right)},
+            'synthesis': {'left': bool(synthesized_left), 'right': bool(synthesized_right)},
+        }
+    }
 
     return {
         'heel_strikes_left': hs_left,
@@ -227,12 +465,19 @@ def detect_gait_cycles(*args, **kwargs) -> Dict[str, Any]:
         'toe_offs_left': to_left,
         'toe_offs_right': to_right,
         'coordination_metrics': coordination,
-        'sampling_frequency': fs,
-        'detector_params': {
-            'vib_band_used': tuple(vib_band_used),
-            'gyro_lpf_used': float(gyro_lpf_used)
+        'event_quality': event_quality,
+        # Flat, backward-compatible values
+        'sampling_frequency': sampling_frequency_flat,
+        'detector_params': detector_params_flat,
+        'filter_adjustments': filter_adjustments_flat,
+        # Detailed, per-side values for richer consumers
+        'sampling_frequency_per_side': {
+            'left': float(fs_left),
+            'right': float(fs_right),
+            'global': float(fs_global) if np.isfinite(fs_global) else None,
         },
-        'filter_adjustments': filter_adjustments
+        'detector_params_per_side': per_side_params,
+        'filter_adjustments_per_side': per_side_adjustments,
     }
 
 def detect_toe_offs_biomech(

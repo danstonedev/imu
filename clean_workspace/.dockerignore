@@ -1,0 +1,17 @@
+__pycache__/
+.pytest_cache/
+.venv/
+venv/
+*.pyc
+*.pyo
+*.pyd
+*.log
+*.tmp
+*.swp
+node_modules/
+.git/
+.gitignore
+**/.DS_Store
+tests/
+imu-gait-diagnostics/
+scripts/*.ps1

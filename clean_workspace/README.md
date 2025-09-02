@@ -51,3 +51,11 @@ git commit -m "feat: initial clean core with CI and docs"
 git branch -M main
 git remote add origin https://github.com/<your-org>/<your-repo>.git
 git push -u origin main
+
+## Architecture
+
+- Core pipeline path: `core/pipeline/pipeline.py` orchestrates calibration, per-side resampling, unified gait detection, stance, joint kinematics, and inverse dynamics.
+- Active modules: `core/pipeline/unified_gait.py`, `core/pipeline/calibration.py`, `core/pipeline/io_utils.py`, `core/pipeline/stance_cycles.py`.
+- Legacy modules: moved under `core/pipeline/legacy/` with shims for back-compat. Prefer unified_gait for event detection. Existing wrappers:
+	- `core/pipeline/biomech_gait.py` → deprecated shim re-exporting `core/pipeline/legacy/biomech_gait.py`.
+	- `core/pipeline/heel_strike_detection.py` → deprecated wrapper delegating to unified_gait/bilateral utilities.

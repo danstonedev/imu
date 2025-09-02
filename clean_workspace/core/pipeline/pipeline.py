@@ -60,6 +60,7 @@ def run_pipeline_clean(data: dict, height_m: float, mass_kg: float, options: dic
     do_cal = bool(options.get('do_cal', True)) if isinstance(options, dict) else True
     yaw_align_flag = bool(options.get('yaw_align', True)) if isinstance(options, dict) else True
     baseline_mode = (options.get('baseline_mode') if isinstance(options, dict) else None) or 'linear'
+    cal_mode = (options.get('cal_mode') if isinstance(options, dict) else None) or 'advanced'
 
     # Check if data contains paths (str) or bytes
     is_paths = isinstance(next(iter(data.values())), str)
@@ -83,11 +84,11 @@ def run_pipeline_clean(data: dict, height_m: float, mass_kg: float, options: dic
     lt  = read_xsens_bytes(lt_bytes)
     rt  = read_xsens_bytes(rt_bytes)
 
-    tP, qP, gP, aP, metaP = extract_kinematics_ex(pel)
-    tLf, qLf, gLf, aLf, _ = extract_kinematics_ex(lf)
-    tRf, qRf, gRf, aRf, _ = extract_kinematics_ex(rf)
-    tLt, qLt, gLt, aLt, _ = extract_kinematics_ex(lt)
-    tRt, qRt, gRt, aRt, _ = extract_kinematics_ex(rt)
+    tP, qP, gP, aP, metaP   = extract_kinematics_ex(pel)
+    tLf, qLf, gLf, aLf, metaLf = extract_kinematics_ex(lf)
+    tRf, qRf, gRf, aRf, metaRf = extract_kinematics_ex(rf)
+    tLt, qLt, gLt, aLt, metaLt = extract_kinematics_ex(lt)
+    tRt, qRt, gRt, aRt, metaRt = extract_kinematics_ex(rt)
 
     # Fallback: derive gyro from quaternions where missing
     if gLf is None:
@@ -111,7 +112,7 @@ def run_pipeline_clean(data: dict, height_m: float, mass_kg: float, options: dic
     # One-shot calibration: per-segment biases and yaw reference (pelvis driven)
     RP_raw = quats_to_R_batch(qP)
     if do_cal:
-        seg_for_bias = {
+        seg_for_bias: dict[str, tuple[np.ndarray | None, np.ndarray | None]] = {
             'pelvis':  (gP, aP),
             'L_femur': (gLf, aLf), 'R_femur': (gRf, aRf),
             'L_tibia': (gLt, aLt), 'R_tibia': (gRt, aRt),
@@ -225,16 +226,424 @@ def run_pipeline_clean(data: dict, height_m: float, mass_kg: float, options: dic
 
     # -----------------------------
     # Joint angles (Grood–Suntay-inspired JCS), radians -> degrees
+    # Two modes:
+    #  - simple: minimal, ordered steps to avoid conflicts
+    #  - advanced (default): full sequence with angle-only yaw leveling + twist + static hip ref
     # -----------------------------
-    hipL_rad = jcs_hip_angles(RP_L, RLf, side='L')
-    hipR_rad = jcs_hip_angles(RP_R, RRf, side='R')
-    kneeL_rad = jcs_knee_angles(RLf, RLt, side='L')
-    kneeR_rad = jcs_knee_angles(RRf, RRt, side='R')
-    rad2deg = 180.0 / np.pi
-    hipL_deg = (hipL_rad * rad2deg).astype(np.float32)
-    hipR_deg = (hipR_rad * rad2deg).astype(np.float32)
-    kneeL_deg = (kneeL_rad * rad2deg).astype(np.float32)
-    kneeR_deg = (kneeR_rad * rad2deg).astype(np.float32)
+    def _mean_rotation(R: np.ndarray, mask: np.ndarray | None = None) -> np.ndarray | None:
+        try:
+            A = np.asarray(R, float)
+            if A.ndim != 3 or A.shape[1:] != (3,3) or A.shape[0] == 0:
+                return None
+            if mask is not None and mask.size == A.shape[0] and mask.any():
+                A = A[mask]
+            M = np.mean(A, axis=0)
+            # Polar decomposition for nearest rotation
+            U, _, Vt = np.linalg.svd(M)
+            Rm = U @ Vt
+            if np.linalg.det(Rm) < 0:
+                U[:, -1] *= -1
+                Rm = U @ Vt
+            return Rm
+        except Exception:
+            return None
+
+    # Build a pelvis-still mask mapped to left/right timelines (already computed as maskL/maskR)
+    # Prefer the 'start' window if available from cal_windows
+    def _window_mask_on_side(t_side: np.ndarray, which: str) -> np.ndarray:
+        if not cal_windows:
+            return np.zeros_like(t_side, dtype=bool)
+        w = next((w for w in cal_windows if w.get('label') == which), None)
+        if not w:
+            return np.zeros_like(t_side, dtype=bool)
+        s = float(w['start_s'] - tP[0]) - (tLf[0] - tP[0] if t_side is tL else (tRf[0] - tP[0]))
+        e = float(w['end_s']   - tP[0]) - (tLf[0] - tP[0] if t_side is tL else (tRf[0] - tP[0]))
+        return (t_side >= s) & (t_side <= e)
+
+    startMaskL = _window_mask_on_side(tL, 'start')
+    startMaskR = _window_mask_on_side(tR, 'start')
+    # If start window missing, fall back to pelvis still resampled onto each side
+    if not startMaskL.any() or not startMaskR.any():
+        tP0 = tP - tP[0]
+        stillP_f = stillP.astype(float) if stillP is not None else np.zeros_like(tP0)
+        deltaL_ang = float(tLf[0] - tP[0])
+        deltaR_ang = float(tRf[0] - tP[0])
+        def _resample_still_local(t_side: np.ndarray, delta: float) -> np.ndarray:
+            if len(tP0) < 2:
+                return np.zeros_like(t_side, dtype=bool)
+            s = np.interp(t_side + delta, tP0, stillP_f, left=stillP_f[0], right=stillP_f[-1])
+            m = s >= 0.75
+            if m.size >= 3:
+                holes = (~m[1:-1]) & (m[:-2] & m[2:])
+                if np.any(holes):
+                    m[1:-1][holes] = True
+            return m
+        if not startMaskL.any():
+            startMaskL = _resample_still_local(tL, deltaL_ang)
+        if not startMaskR.any():
+            startMaskR = _resample_still_local(tR, deltaR_ang)
+
+    R0L = _mean_rotation(RP_L, startMaskL)
+    R0R = _mean_rotation(RP_R, startMaskR)
+    # Use side-specific correction if available, else none
+    def _apply_level(R_series: np.ndarray, Rc: np.ndarray | None) -> np.ndarray:
+        if Rc is None:
+            return R_series
+        return np.einsum('ij,tjk->tik', Rc.T, R_series)
+
+    # Prepare angle-only leveled rotations
+    RP_L_ang = _apply_level(RP_L, R0L)
+    RLf_ang  = _apply_level(RLf,  R0L)
+    RLt_ang  = _apply_level(RLt,  R0L)
+    RP_R_ang = _apply_level(RP_R, R0R)
+    RRf_ang  = _apply_level(RRf,  R0R)
+    RRt_ang  = _apply_level(RRt,  R0R)
+
+    # Defaults for calibration meta shared across branches
+    yaw_med_L = 0.0
+    yaw_med_R = 0.0
+    twist_meta = {'femur_L_deg': 0.0, 'femur_R_deg': 0.0, 'tibia_L_deg': 0.0, 'tibia_R_deg': 0.0}
+    hip_rot_reference = 'JCS_start_still_constant_offset'
+
+    # Simple mode: minimal, conflict-free calibration
+    if cal_mode == 'simple':
+        # No extra yaw leveling; no twist rotations; no static pelvis-x substitution
+        # Compute JCS angles on leveled frames
+        hipL_rad = jcs_hip_angles(RP_L_ang, RLf_ang, side='L')
+        hipR_rad = jcs_hip_angles(RP_R_ang, RRf_ang, side='R')
+        kneeL_rad = jcs_knee_angles(RLf_ang, RLt_ang, side='L')
+        kneeR_rad = jcs_knee_angles(RRf_ang, RRt_ang, side='R')
+        rad2deg = 180.0 / np.pi
+        hipL_deg = (hipL_rad * rad2deg).astype(np.float32)
+        hipR_deg = (hipR_rad * rad2deg).astype(np.float32)
+        kneeL_deg = (kneeL_rad * rad2deg).astype(np.float32)
+        kneeR_deg = (kneeR_rad * rad2deg).astype(np.float32)
+
+        # Pelvis angles (tilt, obliquity, rotation) relative to world (angle-only leveled frames)
+        def _signed_angle_world(a: np.ndarray, b: np.ndarray, axis: np.ndarray) -> np.ndarray:
+            # Signed angle from a to b around axis (right-hand rule)
+            def _norm(v):
+                n = np.linalg.norm(v, axis=-1, keepdims=True)
+                return v / (n + 1e-12)
+            ax = _norm(axis)
+            def _proj(v):
+                return v - (np.sum(v * ax, axis=-1, keepdims=True) * ax)
+            ap = _norm(_proj(a)); bp = _norm(_proj(b))
+            dot = np.clip(np.sum(ap * bp, axis=-1), -1.0, 1.0)
+            ang = np.arccos(dot)
+            cr = np.cross(ap, bp)
+            s = np.sign(np.sum(cr * ax, axis=-1))
+            return ang * s
+        def pelvis_angles_from_R(RP_series: np.ndarray) -> np.ndarray:
+            if RP_series is None or RP_series.ndim != 3 or RP_series.shape[0] == 0:
+                return np.zeros((0,3), dtype=np.float32)
+            # World axes
+            xw = np.array([1.0,0.0,0.0], dtype=float)
+            yw = np.array([0.0,1.0,0.0], dtype=float)
+            zw = np.array([0.0,0.0,1.0], dtype=float)
+            xw_t = np.tile(xw, (RP_series.shape[0],1))
+            yw_t = np.tile(yw, (RP_series.shape[0],1))
+            zw_t = np.tile(zw, (RP_series.shape[0],1))
+            xp = RP_series[:, :, 0]
+            zp = RP_series[:, :, 2]
+            # tilt (sagittal, anterior positive): world Z to pelvis Z about world Y
+            tilt = _signed_angle_world(zw_t, zp, yw_t)
+            # obliquity (frontal, left-up positive): world Z to pelvis Z about world X
+            obl  = _signed_angle_world(zw_t, zp, xw_t)
+            # rotation (transverse, left-forward positive): world X to pelvis X about world Z
+            rot  = _signed_angle_world(xw_t, xp, zw_t)
+            A = np.stack([tilt, obl, rot], axis=1)
+            return (A * (180.0/np.pi)).astype(np.float32)
+
+        pelvisL_deg = pelvis_angles_from_R(RP_L_ang)
+        pelvisR_deg = pelvis_angles_from_R(RP_R_ang)
+
+        # Constant baseline on start window only (keep it simple)
+        def _baseline_const(A_deg: np.ndarray, mask: np.ndarray):
+            if A_deg is None or len(A_deg) == 0 or not (isinstance(mask, np.ndarray) and mask.any()):
+                z = np.zeros(3, dtype=np.float32); return A_deg, z, z
+            b = np.median(A_deg[mask], axis=0).astype(np.float32)
+            B = (A_deg - b).astype(np.float32)
+            return B, b, b
+        hipR_deg, hipR_b0, hipR_b1 = _baseline_const(hipR_deg, startMaskR)
+        kneeL_deg, kneeL_b0, kneeL_b1 = _baseline_const(kneeL_deg, startMaskL)
+        kneeR_deg, kneeR_b0, kneeR_b1 = _baseline_const(kneeR_deg, startMaskR)
+        pelvisL_deg, pelvisL_b0, pelvisL_b1 = _baseline_const(pelvisL_deg, startMaskL)
+        pelvisR_deg, pelvisR_b0, pelvisR_b1 = _baseline_const(pelvisR_deg, startMaskR)
+        # Record baseline source for angles in simple mode
+        angles_baseline_source = {'hip': 'start_window_only', 'knee': 'start_window_only'}
+    else:
+        # Advanced mode: angle-only yaw leveling + functional twist + static hip reference
+        # Optional: angle-only pelvis yaw leveling to remove residual heading for angles.
+        def _Rz_world(phi: float) -> np.ndarray:
+            c, s = float(np.cos(phi)), float(np.sin(phi))
+            return np.array([[c,-s,0.0],[s,c,0.0],[0.0,0.0,1.0]], dtype=float)
+
+        yawL = yaw_from_R(RP_L_ang) if isinstance(RP_L_ang, np.ndarray) else np.array([])
+        yawR = yaw_from_R(RP_R_ang) if isinstance(RP_R_ang, np.ndarray) else np.array([])
+        yaw_med_L = float(np.median(yawL[startMaskL])) if (yawL.size and startMaskL.any()) else 0.0
+        yaw_med_R = float(np.median(yawR[startMaskR])) if (yawR.size and startMaskR.any()) else 0.0
+
+        if np.isfinite(yaw_med_L) and abs(yaw_med_L) > 0:
+            RzL = _Rz_world(-yaw_med_L)
+            RP_L_ang = np.einsum('ij,tjk->tik', RzL, RP_L_ang)
+            RLf_ang  = np.einsum('ij,tjk->tik', RzL, RLf_ang)
+            RLt_ang  = np.einsum('ij,tjk->tik', RzL, RLt_ang)
+        if np.isfinite(yaw_med_R) and abs(yaw_med_R) > 0:
+            RzR = _Rz_world(-yaw_med_R)
+            RP_R_ang = np.einsum('ij,tjk->tik', RzR, RP_R_ang)
+            RRf_ang  = np.einsum('ij,tjk->tik', RzR, RRf_ang)
+            RRt_ang  = np.einsum('ij,tjk->tik', RzR, RRt_ang)
+
+        # ---------------------------------------------
+        # Functional twist calibration (advanced)
+        # ---------------------------------------------
+
+    # ---------------------------------------------
+    # Functional IBS twist calibration (angle-only) — ADVANCED ONLY
+    # Apply a constant rotation about each segment's local long axis (z)
+    # so that in the start-still window: hip axial rotation ≈ 0 and knee axial rotation ≈ 0.
+    # Use segment-specific stillness: femur-still for hip twist; tibia-still for knee twist.
+    # This reduces unrealistic hip rot ROM and removes knee rot offsets due to sensor twist.
+    # ---------------------------------------------
+    if cal_mode != 'simple':
+        def _normalize(v: np.ndarray, eps: float = 1e-9) -> np.ndarray:
+            v = np.asarray(v, dtype=float)
+            n = float(np.linalg.norm(v))
+            return v / (n + eps)
+
+        def _proj_on_plane(v: np.ndarray, n_hat: np.ndarray) -> np.ndarray:
+            n = _normalize(n_hat)
+            return v - (np.dot(v, n) * n)
+
+        def _signed_angle(a: np.ndarray, b: np.ndarray, axis: np.ndarray, eps: float = 1e-9) -> float:
+            # Signed angle from a to b around axis (RHR)
+            na = _normalize(_proj_on_plane(a, axis))
+            nb = _normalize(_proj_on_plane(b, axis))
+            dot = float(np.clip(np.dot(na, nb), -1.0, 1.0))
+            ang = float(np.arccos(dot))
+            cr = np.cross(na, nb)
+            s = float(np.sign(np.dot(cr, _normalize(axis))))
+            return ang * s
+
+        def _mean_rot(R_series: np.ndarray, mask: np.ndarray) -> np.ndarray | None:
+            try:
+                if R_series is None or R_series.ndim != 3 or R_series.shape[0] == 0:
+                    return None
+                A = R_series[mask] if (mask is not None and mask.size == R_series.shape[0] and mask.any()) else R_series
+                M = np.mean(A, axis=0)
+                U, _, Vt = np.linalg.svd(M)
+                Rm = U @ Vt
+                if np.linalg.det(Rm) < 0:
+                    U[:, -1] *= -1
+                    Rm = U @ Vt
+                return Rm
+            except Exception:
+                return None
+
+        def _Rz_local(phi: float) -> np.ndarray:
+            c, s = float(np.cos(phi)), float(np.sin(phi))
+            return np.array([[c,-s,0.0],[s,c,0.0],[0.0,0.0,1.0]], dtype=float)
+
+        # Compute per-side twists (hip: femur about its z; knee: tibia about its z)
+        # Build segment still masks (gyro magnitude below threshold)
+        def _seg_still_mask(gyro_side: np.ndarray, t_side: np.ndarray) -> np.ndarray:
+            try:
+                from ..config.constants import STILL_THR_W  # rad/s
+                thr = float(STILL_THR_W)
+            except Exception:
+                thr = 0.6  # conservative fallback
+            if gyro_side is None or len(gyro_side) == 0:
+                return np.zeros_like(t_side, dtype=bool)
+            gmag = np.linalg.norm(gyro_side, axis=1)
+            # light smoothing ~0.2s
+            def _fs_est_local(t: np.ndarray) -> float:
+                if t is None or len(t) < 2:
+                    return 100.0
+                dt = np.diff(t)
+                dt = dt[np.isfinite(dt) & (dt > 0)]
+                return float(1.0 / np.median(dt)) if dt.size else 100.0
+            Fs_use = _fs_est_local(t_side)
+            win = max(1, int(round(0.2 * Fs_use)))
+            gmag_s = moving_avg(gmag, win=win)
+            return (gmag_s < thr)
+
+        femur_still_L_tw = _seg_still_mask(gLf_res, tL)
+        femur_still_R_tw = _seg_still_mask(gRf_res, tR)
+        tibia_still_L_tw = _seg_still_mask(gLt_res, tL)
+        tibia_still_R_tw = _seg_still_mask(gRt_res, tR)
+
+        # Core still selector: pick longest contiguous True run, require >= ~0.4s; else keep original mask
+        def _core_still(mask: np.ndarray, t_side: np.ndarray) -> np.ndarray:
+            m = np.asarray(mask, dtype=bool)
+            if m.size == 0:
+                return m
+            # estimate Fs locally
+            def _fs_est_local(t: np.ndarray) -> float:
+                if t is None or len(t) < 2:
+                    return 100.0
+                dt = np.diff(t)
+                dt = dt[np.isfinite(dt) & (dt > 0)]
+                return float(1.0 / np.median(dt)) if dt.size else 100.0
+            Fs_use = _fs_est_local(t_side)
+            min_len = max(5, int(round(0.4 * Fs_use)))
+            # find runs
+            best_s, best_e = -1, -1
+            i = 0
+            while i < m.size:
+                if m[i]:
+                    j = i
+                    while j < m.size and m[j]:
+                        j += 1
+                    if (j - i) >= min_len and (j - i) > (best_e - best_s):
+                        best_s, best_e = i, j
+                    i = j
+                else:
+                    i += 1
+            if best_e > best_s:
+                out = np.zeros_like(m)
+                out[best_s:best_e] = True
+                return out
+            return m
+
+        # Prefer start still window intersected with segment-still; fallback to start still alone
+        hip_mask_L = (startMaskL & femur_still_L_tw) if (startMaskL.any() and femur_still_L_tw.any()) else startMaskL
+        hip_mask_R = (startMaskR & femur_still_R_tw) if (startMaskR.any() and femur_still_R_tw.any()) else startMaskR
+        knee_mask_L = (startMaskL & tibia_still_L_tw) if (startMaskL.any() and tibia_still_L_tw.any()) else startMaskL
+        knee_mask_R = (startMaskR & tibia_still_R_tw) if (startMaskR.any() and tibia_still_R_tw.any()) else startMaskR
+        # tighten to core still windows
+        hip_mask_L = _core_still(hip_mask_L, tL)
+        hip_mask_R = _core_still(hip_mask_R, tR)
+        knee_mask_L = _core_still(knee_mask_L, tL)
+        knee_mask_R = _core_still(knee_mask_R, tR)
+
+        twist_meta = {'femur_L_deg': 0.0, 'femur_R_deg': 0.0, 'tibia_L_deg': 0.0, 'tibia_R_deg': 0.0}
+
+        # Median-JCS approach: compute preliminary JCS angles on leveled frames,
+        # then zero the median axial rotation in still windows by rotating the segment about its local z.
+        hipL_pre = jcs_hip_angles(RP_L_ang, RLf_ang, side='L')
+        hipR_pre = jcs_hip_angles(RP_R_ang, RRf_ang, side='R')
+        kneeL_pre = jcs_knee_angles(RLf_ang, RLt_ang, side='L')
+        kneeR_pre = jcs_knee_angles(RRf_ang, RRt_ang, side='R')
+
+        def _median_axial_rad(A: np.ndarray, mask: np.ndarray) -> float:
+            try:
+                if A is None or A.ndim != 2 or A.shape[1] < 3 or A.shape[0] == 0:
+                    return 0.0
+                if mask is not None and mask.size == A.shape[0] and mask.any():
+                    v = A[mask, 2]
+                else:
+                    v = A[:, 2]
+                if v.size == 0:
+                    return 0.0
+                return float(np.median(v))
+            except Exception:
+                return 0.0
+
+        phi_hip_L = _median_axial_rad(hipL_pre, hip_mask_L)
+        phi_hip_R = _median_axial_rad(hipR_pre, hip_mask_R)
+        phi_knee_L = _median_axial_rad(kneeL_pre, knee_mask_L)
+        phi_knee_R = _median_axial_rad(kneeR_pre, knee_mask_R)
+
+        # (No clamping; rely on robust still-window medians to avoid extreme corrections)
+
+        if np.isfinite(phi_hip_L):
+            RLf_ang = np.einsum('tij,jk->tik', RLf_ang, _Rz_local(-phi_hip_L))
+            twist_meta['femur_L_deg'] = float(np.degrees(phi_hip_L))
+        if np.isfinite(phi_hip_R):
+            RRf_ang = np.einsum('tij,jk->tik', RRf_ang, _Rz_local(-phi_hip_R))
+            twist_meta['femur_R_deg'] = float(np.degrees(phi_hip_R))
+        if np.isfinite(phi_knee_L):
+            RLt_ang = np.einsum('tij,jk->tik', RLt_ang, _Rz_local(-phi_knee_L))
+            twist_meta['tibia_L_deg'] = float(np.degrees(phi_knee_L))
+        if np.isfinite(phi_knee_R):
+            RRt_ang = np.einsum('tij,jk->tik', RRt_ang, _Rz_local(-phi_knee_R))
+            twist_meta['tibia_R_deg'] = float(np.degrees(phi_knee_R))
+
+        # Compute angles on leveled frames
+        hipL_rad = jcs_hip_angles(RP_L_ang, RLf_ang, side='L')
+        hipR_rad = jcs_hip_angles(RP_R_ang, RRf_ang, side='R')
+        # Replace hip axial rotation with a static-pelvis reference (start-still pelvis x)
+        # to reduce residual heading/obliquity leakage into hip rotation ROM.
+        def _static_pelvis_x_rot(RP_ang: np.ndarray, Rf_ang: np.ndarray, mask_still: np.ndarray) -> np.ndarray | None:
+            try:
+                if RP_ang is None or RP_ang.ndim != 3 or Rf_ang is None:
+                    return None
+                xp = RP_ang[:, :, 0]
+                kf = Rf_ang[:, :, 2]
+                xf = Rf_ang[:, :, 0]
+                # mean pelvis x over still
+                if mask_still is not None and mask_still.any() and mask_still.size == RP_ang.shape[0]:
+                    xp0 = np.mean(xp[mask_still], axis=0)
+                else:
+                    xp0 = np.mean(xp, axis=0)
+                xp0 = xp0 / (np.linalg.norm(xp0) + 1e-12)
+                # project onto plane normal to kf per-sample
+                def proj(v, n):
+                    n_ = n / (np.linalg.norm(n, axis=-1, keepdims=True) + 1e-12)
+                    return v - (np.sum(v * n_, axis=-1, keepdims=True) * n_)
+                xp0_rep = np.tile(xp0[None, :], (Rf_ang.shape[0], 1))
+                a = proj(xp0_rep, kf)
+                b = proj(xf, kf)
+                # normalize
+                def norm(v):
+                    return v / (np.linalg.norm(v, axis=-1, keepdims=True) + 1e-12)
+                a = norm(a); b = norm(b); k = norm(kf)
+                dot = np.clip(np.sum(a * b, axis=-1), -1.0, 1.0)
+                ang = np.arccos(dot)
+                cross = np.cross(a, b)
+                sign = np.sign(np.sum(cross * k, axis=-1))
+                return ang * sign
+            except Exception:
+                return None
+        hipL_rot_static = _static_pelvis_x_rot(RP_L_ang, RLf_ang, startMaskL)
+        hipR_rot_static = _static_pelvis_x_rot(RP_R_ang, RRf_ang, startMaskR)
+        if isinstance(hipL_rot_static, np.ndarray) and hipL_rot_static.shape[0] == hipL_rad.shape[0]:
+            hipL_rad[:, 2] = hipL_rot_static
+        if isinstance(hipR_rot_static, np.ndarray) and hipR_rot_static.shape[0] == hipR_rad.shape[0]:
+            hipR_rad[:, 2] = hipR_rot_static
+        kneeL_rad = jcs_knee_angles(RLf_ang, RLt_ang, side='L')
+        kneeR_rad = jcs_knee_angles(RRf_ang, RRt_ang, side='R')
+        rad2deg = 180.0 / np.pi
+        hipL_deg = (hipL_rad * rad2deg).astype(np.float32)
+        hipR_deg = (hipR_rad * rad2deg).astype(np.float32)
+        kneeL_deg = (kneeL_rad * rad2deg).astype(np.float32)
+        kneeR_deg = (kneeR_rad * rad2deg).astype(np.float32)
+        hip_rot_reference = 'static_pelvis_x_start_still'
+
+        # Pelvis angles after angle-only leveling/yaw leveling
+        def _signed_angle_world(a: np.ndarray, b: np.ndarray, axis: np.ndarray) -> np.ndarray:
+            def _norm(v):
+                n = np.linalg.norm(v, axis=-1, keepdims=True)
+                return v / (n + 1e-12)
+            ax = _norm(axis)
+            def _proj(v):
+                return v - (np.sum(v * ax, axis=-1, keepdims=True) * ax)
+            ap = _norm(_proj(a)); bp = _norm(_proj(b))
+            dot = np.clip(np.sum(ap * bp, axis=-1), -1.0, 1.0)
+            ang = np.arccos(dot)
+            cr = np.cross(ap, bp)
+            s = np.sign(np.sum(cr * ax, axis=-1))
+            return ang * s
+        def pelvis_angles_from_R(RP_series: np.ndarray) -> np.ndarray:
+            if RP_series is None or RP_series.ndim != 3 or RP_series.shape[0] == 0:
+                return np.zeros((0,3), dtype=np.float32)
+            xw = np.array([1.0,0.0,0.0], dtype=float)
+            yw = np.array([0.0,1.0,0.0], dtype=float)
+            zw = np.array([0.0,0.0,1.0], dtype=float)
+            xw_t = np.tile(xw, (RP_series.shape[0],1))
+            yw_t = np.tile(yw, (RP_series.shape[0],1))
+            zw_t = np.tile(zw, (RP_series.shape[0],1))
+            xp = RP_series[:, :, 0]
+            zp = RP_series[:, :, 2]
+            tilt = _signed_angle_world(zw_t, zp, yw_t)
+            obl  = _signed_angle_world(zw_t, zp, xw_t)
+            rot  = _signed_angle_world(xw_t, xp, zw_t)
+            A = np.stack([tilt, obl, rot], axis=1)
+            return (A * (180.0/np.pi)).astype(np.float32)
+
+    pelvisL_deg = pelvis_angles_from_R(RP_L_ang)
+    pelvisR_deg = pelvis_angles_from_R(RP_R_ang)
 
     gLf_res = moving_avg(gLf_res, win=7)
     gLt_res = moving_avg(gLt_res, win=7)
@@ -253,16 +662,18 @@ def run_pipeline_clean(data: dict, height_m: float, mass_kg: float, options: dic
 
     # Make gravity handling explicit from headers, with optional safety net
     from ..config.constants import G as G_W
-    acc_is_free = bool(metaP.get('acc_is_free', False))
-    def gravity_handle(aW: np.ndarray) -> tuple[np.ndarray, dict]:
+    # Use tibia-specific headers to determine whether acceleration already excludes gravity
+    acc_is_free_L = bool(metaLt.get('acc_is_free', False))
+    acc_is_free_R = bool(metaRt.get('acc_is_free', False))
+    def gravity_handle(aW: np.ndarray, is_free: bool) -> tuple[np.ndarray, dict]:
         if aW is None or len(aW) == 0:
             return aW, {'applied': False, 'mode': 'none'}
-        if acc_is_free:
+        if is_free:
             return aW.astype(np.float32), {'applied': False, 'mode': 'freeacc_headers'}
         # Assume raw accelerometer: subtract gravity in world frame
         return (aW - G_W).astype(np.float32), {'applied': True, 'mode': 'subtract_g_world'}
-    aL_free_W, acc_corr_L = gravity_handle(aL_W)
-    aR_free_W, acc_corr_R = gravity_handle(aR_W)
+    aL_free_W, acc_corr_L = gravity_handle(aL_W, acc_is_free_L)
+    aR_free_W, acc_corr_R = gravity_handle(aR_W, acc_is_free_R)
 
     # Unified biomechanical gait cycle detection
     gait_results = detect_gait_cycles(
@@ -272,7 +683,7 @@ def run_pipeline_clean(data: dict, height_m: float, mass_kg: float, options: dic
         t_right=tR,
         accel_right=aR_free_W,
         gyro_right=omegaR_shank_W,
-        fs=Fs
+        fs=Fs  # optional; per-side fs inferred from t_left/t_right
     )
     
     # Extract heel strikes for cycle analysis (indices)
@@ -321,6 +732,44 @@ def run_pipeline_clean(data: dict, height_m: float, mass_kg: float, options: dic
     maskL = resample_still(tL, deltaL)
     maskR = resample_still(tR, deltaR)
 
+    # Refine angle baseline masks by also requiring segment stillness on each side
+    try:
+        from ..config.constants import STILL_THR_W
+        def femur_still_mask(gyro_side: np.ndarray) -> np.ndarray:
+            if gyro_side is None or len(gyro_side) == 0:
+                return np.zeros(0, dtype=bool)
+            gmag = np.linalg.norm(gyro_side, axis=1)
+            # light smoothing window ~0.2s; reuse moving_avg previously imported
+            # Estimate side Fs from tL/tR separately
+            def _fs_est_local(t: np.ndarray) -> float:
+                if t is None or len(t) < 2:
+                    return 100.0
+                dt = np.diff(t)
+                dt = dt[np.isfinite(dt) & (dt > 0)]
+                return float(1.0 / np.median(dt)) if dt.size else 100.0
+            FsL = _fs_est_local(tL)
+            FsR = _fs_est_local(tR)
+            Fs_use = FsL if gyro_side is gLf_res else FsR
+            win = max(1, int(round(0.2 * Fs_use)))
+            gmag_s = moving_avg(gmag, win=win)
+            return (gmag_s < float(STILL_THR_W))
+        femur_still_L = femur_still_mask(gLf_res)
+        femur_still_R = femur_still_mask(gRf_res)
+        hip_maskL_base = maskL & femur_still_L if femur_still_L.size == maskL.size else maskL
+        hip_maskR_base = maskR & femur_still_R if femur_still_R.size == maskR.size else maskR
+        # Build tibia still masks similarly
+        tibia_still_L_base = femur_still_mask(gLt_res)
+        tibia_still_R_base = femur_still_mask(gRt_res)
+        knee_maskL_base = maskL & tibia_still_L_base if tibia_still_L_base.size == maskL.size else maskL
+        knee_maskR_base = maskR & tibia_still_R_base if tibia_still_R_base.size == maskR.size else maskR
+        angles_baseline_source = {'hip': 'pelvis_still∩femur_still', 'knee': 'pelvis_still∩tibia_still'}
+    except Exception:
+        hip_maskL_base = maskL
+        hip_maskR_base = maskR
+        knee_maskL_base = maskL
+        knee_maskR_base = maskR
+        angles_baseline_source = {'hip': 'pelvis_still_only', 'knee': 'pelvis_still_only'}
+
     # Fallback: build masks from explicit calibration windows if still masks are sparse
     def mask_from_windows(t_side: np.ndarray, delta: float):
         if not cal_windows:
@@ -337,6 +786,12 @@ def run_pipeline_clean(data: dict, height_m: float, mass_kg: float, options: dic
         maskL = mask_from_windows(tL, deltaL)
     if not maskR.any():
         maskR = mask_from_windows(tR, deltaR)
+    # Ensure per-joint masks exist even if fallback was used
+    if 'hip_maskL_base' not in locals():
+        hip_maskL_base = maskL
+        hip_maskR_base = maskR
+        knee_maskL_base = maskL
+        knee_maskR_base = maskR
 
     def subtract_baseline(MJ: np.ndarray, t_side: np.ndarray, mask: np.ndarray):
         if baseline_mode == 'none':
@@ -427,10 +882,14 @@ def run_pipeline_clean(data: dict, height_m: float, mass_kg: float, options: dic
         base_t = b0 + s[:, None] * (b1 - b0)
         return (A - base_t).astype(np.float32), b0, b1
 
-    hipL_deg, hipL_b0, hipL_b1 = subtract_angle_baseline(hipL_deg, tL, maskL)
-    hipR_deg, hipR_b0, hipR_b1 = subtract_angle_baseline(hipR_deg, tR, maskR)
-    kneeL_deg, kneeL_b0, kneeL_b1 = subtract_angle_baseline(kneeL_deg, tL, maskL)
-    kneeR_deg, kneeR_b0, kneeR_b1 = subtract_angle_baseline(kneeR_deg, tR, maskR)
+    if cal_mode != 'simple':
+        hipL_deg, hipL_b0, hipL_b1 = subtract_angle_baseline(hipL_deg, tL, hip_maskL_base)
+        hipR_deg, hipR_b0, hipR_b1 = subtract_angle_baseline(hipR_deg, tR, hip_maskR_base)
+        kneeL_deg, kneeL_b0, kneeL_b1 = subtract_angle_baseline(kneeL_deg, tL, knee_maskL_base)
+        kneeR_deg, kneeR_b0, kneeR_b1 = subtract_angle_baseline(kneeR_deg, tR, knee_maskR_base)
+        # Pelvis angles baselining (advanced): use start still masks per side
+        pelvisL_deg, pelvisL_b0, pelvisL_b1 = subtract_angle_baseline(pelvisL_deg, tL, startMaskL)
+        pelvisR_deg, pelvisR_b0, pelvisR_b1 = subtract_angle_baseline(pelvisR_deg, tR, startMaskR)
 
     # Angle flexion sign already enforced by enforce_lr_conventions
 
@@ -528,10 +987,14 @@ def run_pipeline_clean(data: dict, height_m: float, mass_kg: float, options: dic
         dt = np.diff(t)
         dt = dt[np.isfinite(dt) & (dt > 0)]
         return float(1.0 / np.median(dt)) if dt.size else float('nan')
+    # Prefer per-side sampling frequencies when provided
+    fsr = gait_results.get('sampling_frequency_per_side', {})
     fs_meta = {
-        'pelvis': _fs_est(tP),
-        'L_femur': _fs_est(tL), 'R_femur': _fs_est(tR),
-        'L_tibia': _fs_est(tL), 'R_tibia': _fs_est(tR),
+            'pelvis': _fs_est(tP),
+            'L_femur': float(fsr.get('left', _fs_est(tL))) if isinstance(fsr, dict) else _fs_est(tL),
+            'R_femur': float(fsr.get('right', _fs_est(tR))) if isinstance(fsr, dict) else _fs_est(tR),
+            'L_tibia': float(fsr.get('left', _fs_est(tL))) if isinstance(fsr, dict) else _fs_est(tL),
+            'R_tibia': float(fsr.get('right', _fs_est(tR))) if isinstance(fsr, dict) else _fs_est(tR),
     }
     
     def cycle_mean_sd(t, sig, contacts, toe_offs):
@@ -553,7 +1016,7 @@ def run_pipeline_clean(data: dict, height_m: float, mass_kg: float, options: dic
             # Return default arrays with 101 points for compatibility
             n_points = 101
             shape = (n_points, sig.shape[1]) if sig.ndim > 1 else (n_points,)
-            return (np.zeros(shape, dtype=np.float32), 
+            return (np.zeros(shape, dtype=np.float32),
                     np.zeros(shape, dtype=np.float32), 0, 0)
 
     def cycles(sig, t, contacts, toe_offs):
@@ -823,6 +1286,17 @@ def run_pipeline_clean(data: dict, height_m: float, mass_kg: float, options: dic
         'R': angle_cycles_triplet(kneeR_deg, tR, contacts_R, toe_offs_R),
     }
 
+    # Pelvis angle cycles (tilt, obliquity, rotation)
+    def pelvis_cycles_triplet(pel_deg: np.ndarray, t_side: np.ndarray, contacts: np.ndarray, toe_offs: np.ndarray):
+        tiltC, n_used, n_tot = cycles(pel_deg[:, 0], t_side, contacts, toe_offs)
+        oblC,  _, _          = cycles(pel_deg[:, 1], t_side, contacts, toe_offs)
+        rotC,  _, _          = cycles(pel_deg[:, 2], t_side, contacts, toe_offs)
+        return { 'tilt': tiltC, 'obl': oblC, 'rot': rotC, 'count_used': n_used, 'count_total': n_tot }
+    pelvis_cycles = {
+        'L': pelvis_cycles_triplet(pelvisL_deg, tL, contacts_L, toe_offs_L),
+        'R': pelvis_cycles_triplet(pelvisR_deg, tR, contacts_R, toe_offs_R),
+    }
+
     # Build cycle-level CSVs (101-point means) including magnitude variants for download
     def build_cycle_csv(side_key: str) -> str:
         side = cycles_out[side_key]
@@ -877,6 +1351,22 @@ def run_pipeline_clean(data: dict, height_m: float, mass_kg: float, options: dic
         )
     )
 
+    # Pelvis time CSVs
+    left_pelvis_angles_csv = (
+        "time_s,L_pelvis_tilt_deg,L_pelvis_obl_deg,L_pelvis_rot_deg\n"
+        + "\n".join(
+            f"{t:.6f},{ti:.6f},{ob:.6f},{ro:.6f}"
+            for t, (ti,ob,ro) in zip(tL, pelvisL_deg)
+        )
+    )
+    right_pelvis_angles_csv = (
+        "time_s,R_pelvis_tilt_deg,R_pelvis_obl_deg,R_pelvis_rot_deg\n"
+        + "\n".join(
+            f"{t:.6f},{ti:.6f},{ob:.6f},{ro:.6f}"
+            for t, (ti,ob,ro) in zip(tR, pelvisR_deg)
+        )
+    )
+
     # Angle cycle CSVs (101-point means)
     def build_angle_cycle_csv(side_key: str, joint: str) -> str:
         jd = hip_cycles[side_key] if joint == 'hip' else knee_cycles[side_key]
@@ -905,6 +1395,32 @@ def run_pipeline_clean(data: dict, height_m: float, mass_kg: float, options: dic
     right_hip_cycle_csv = build_angle_cycle_csv('R', 'hip')
     left_knee_cycle_csv = build_angle_cycle_csv('L', 'knee')
     right_knee_cycle_csv = build_angle_cycle_csv('R', 'knee')
+
+    # Pelvis cycle CSVs
+    def build_pelvis_cycle_csv(side_key: str) -> str:
+        jd = pelvis_cycles[side_key]
+        tilt_m = np.asarray(jd['tilt']['mean'], dtype=np.float32)
+        obl_m  = np.asarray(jd['obl']['mean'], dtype=np.float32)
+        rot_m  = np.asarray(jd['rot']['mean'], dtype=np.float32)
+        tilt_s = np.asarray(jd['tilt']['sd'], dtype=np.float32)
+        obl_s  = np.asarray(jd['obl']['sd'], dtype=np.float32)
+        rot_s  = np.asarray(jd['rot']['sd'], dtype=np.float32)
+        n = int(max(tilt_m.shape[0], obl_m.shape[0], rot_m.shape[0]))
+        phase = np.linspace(0, 100, n, dtype=np.float32)
+        hdr = "phase_pct,pelvis_tilt_mean(deg),pelvis_tilt_sd(deg),pelvis_obl_mean(deg),pelvis_obl_sd(deg),pelvis_rot_mean(deg),pelvis_rot_sd(deg)"
+        lines = [hdr]
+        for i in range(n):
+            tm = float(tilt_m[i]) if i < len(tilt_m) else 0.0
+            ts = float(tilt_s[i]) if i < len(tilt_s) else 0.0
+            om = float(obl_m[i]) if i < len(obl_m) else 0.0
+            os = float(obl_s[i]) if i < len(obl_s) else 0.0
+            rm = float(rot_m[i]) if i < len(rot_m) else 0.0
+            rs = float(rot_s[i]) if i < len(rot_s) else 0.0
+            lines.append(f"{phase[i]:.2f},{tm:.6f},{ts:.6f},{om:.6f},{os:.6f},{rm:.6f},{rs:.6f}")
+        return "\n".join(lines)
+
+    left_pelvis_cycle_csv = build_pelvis_cycle_csv('L')
+    right_pelvis_cycle_csv = build_pelvis_cycle_csv('R')
 
     # CSVs for anchored comparison (what the matrix view displays)
     def build_compare_csv(cmp: dict) -> str:
@@ -951,9 +1467,11 @@ def run_pipeline_clean(data: dict, height_m: float, mass_kg: float, options: dic
 
     # Event diagnostics (if available)
     event_quality = gait_results.get('event_quality', {}) if isinstance(gait_results, dict) else {}
+    # sampling_frequency may be a float or a per-side dict; keep as-is for transparency
+    sf_val = gait_results.get('sampling_frequency', Fs)
     detector_info = {
         'detector': 'unified_gait',
-        'sampling_frequency': float(gait_results.get('sampling_frequency', Fs)),
+        'sampling_frequency': sf_val,
         'params': gait_results.get('detector_params', {}),
         'filter_adjustments': gait_results.get('filter_adjustments', {}),
     }
@@ -995,18 +1513,27 @@ def run_pipeline_clean(data: dict, height_m: float, mass_kg: float, options: dic
         # New: angles time-series (deg) and CSVs
         'L_hip_angles_deg': hipL_deg, 'R_hip_angles_deg': hipR_deg,
         'L_knee_angles_deg': kneeL_deg, 'R_knee_angles_deg': kneeR_deg,
+    'L_pelvis_angles_deg': pelvisL_deg, 'R_pelvis_angles_deg': pelvisR_deg,
         'left_angles_csv': left_angles_csv, 'right_angles_csv': right_angles_csv,
+    'left_pelvis_angles_csv': left_pelvis_angles_csv, 'right_pelvis_angles_csv': right_pelvis_angles_csv,
         'left_hip_cycle_csv': left_hip_cycle_csv, 'right_hip_cycle_csv': right_hip_cycle_csv,
         'left_knee_cycle_csv': left_knee_cycle_csv, 'right_knee_cycle_csv': right_knee_cycle_csv,
+    'left_pelvis_cycle_csv': left_pelvis_cycle_csv, 'right_pelvis_cycle_csv': right_pelvis_cycle_csv,
     'anchor_L_compare_csv': anchor_L_compare_csv, 'anchor_R_compare_csv': anchor_R_compare_csv,
         'Lmean': Lmean, 'Lsd': Lsd, 'Rmean': Rmean, 'Rsd': Rsd,
         'cycles': cycles_out,
-        'angle_cycles': { 'hip': hip_cycles, 'knee': knee_cycles },
-    'angle_compare': angle_compare,
+    'angle_cycles': { 'hip': hip_cycles, 'knee': knee_cycles, 'pelvis': pelvis_cycles },
+        'angle_compare': angle_compare,
+        # Events in absolute seconds on each limb timeline (for diagnostics/tests)
+        'events': {
+            'HS_L': hsL_times.tolist(), 'TO_L': toL_times.tolist(),
+            'HS_R': hsR_times.tolist(), 'TO_R': toR_times.tolist(),
+        },
     'cycles_compare': cycles_compare,
         'cal_windows': cal_windows,
         'meta': {
             'baseline_mode': baseline_mode,
+            'cal_mode': cal_mode,
             'cycle_phase_points': 101,
             'sign_convention': 'flexion_positive_Mx; right_xz_mirrored',
             'magnitude_baseline': 'BESR_on_|M|',
@@ -1022,7 +1549,24 @@ def run_pipeline_clean(data: dict, height_m: float, mass_kg: float, options: dic
             'stance_thresholds_used': stance_thresholds,
             'detector': detector_info,
             'acc_gravity_correction': { 'L': acc_corr_L, 'R': acc_corr_R },
+            'acc_is_free_flags': { 'pelvis': bool(metaP.get('acc_is_free', False)), 'L_tibia': acc_is_free_L, 'R_tibia': acc_is_free_R },
             'overlap_window_s': overlap_meta,
+            'angles_baseline_source': angles_baseline_source,
+            'angles_calibration': {
+                'pelvis_leveling': bool(R0L is not None or R0R is not None),
+                'start_window_used': bool(startMaskL.any() or startMaskR.any()),
+                'angle_yaw_leveling': ({
+                    'applied': False,
+                    'median_yaw_L_rad': 0.0,
+                    'median_yaw_R_rad': 0.0,
+                } if cal_mode == 'simple' else {
+                    'applied': True,
+                    'median_yaw_L_rad': float(yaw_med_L),
+                    'median_yaw_R_rad': float(yaw_med_R),
+                }),
+                'twist_deg': twist_meta,
+                'hip_rot_reference': (hip_rot_reference if 'hip_rot_reference' in locals() else 'JCS_start_still_constant_offset'),
+            },
         },
         'baseline_JCS': {
             'L': {'start': baseL0.astype(np.float32), 'end': baseL1.astype(np.float32)},
@@ -1036,6 +1580,10 @@ def run_pipeline_clean(data: dict, height_m: float, mass_kg: float, options: dic
             'knee': {
                 'L': {'start': kneeL_b0.astype(np.float32), 'end': kneeL_b1.astype(np.float32)},
                 'R': {'start': kneeR_b0.astype(np.float32), 'end': kneeR_b1.astype(np.float32)},
+            },
+            'pelvis': {
+                'L': {'start': pelvisL_b0.astype(np.float32), 'end': pelvisL_b1.astype(np.float32)},
+                'R': {'start': pelvisR_b0.astype(np.float32), 'end': pelvisR_b1.astype(np.float32)},
             },
         },
         'angle_sign_convention': 'flexion_positive; adduction positive toward midline; internal rotation positive',

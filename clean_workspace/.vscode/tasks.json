@@ -1,0 +1,21 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "pytest imu-gait-diagnostics",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-ExecutionPolicy",
+				"Bypass",
+				"-Command",
+				"Set-Location 'c:\\Users\\danst\\imu\\clean_workspace\\imu-gait-diagnostics'; pytest -q"
+			],
+			"problemMatcher": [
+				"$pytest-stylish"
+			],
+			"group": "build"
+		}
+	]
+}

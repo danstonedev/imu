@@ -1,0 +1,12 @@
+{
+  "data": {
+    "pelvis": "c:/Users/danst/imu/clean_workspace/sample data/DEMO6_0_20250209_221452_176.csv",
+    "lfemur": "c:/Users/danst/imu/clean_workspace/sample data/DEMO6_1_20250209_221452_178.csv",
+    "rfemur": "c:/Users/danst/imu/clean_workspace/sample data/DEMO6_2_20250209_221452_174.csv",
+    "ltibia": "c:/Users/danst/imu/clean_workspace/sample data/DEMO6_3_20250209_221452_179.csv",
+    "rtibia": "c:/Users/danst/imu/clean_workspace/sample data/DEMO6_4_20250209_221452_177.csv"
+  },
+  "height_m": 1.75,
+  "mass_kg": 75.0,
+  "options": { "do_cal": true, "yaw_align": true }
+}
