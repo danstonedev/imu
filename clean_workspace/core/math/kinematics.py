@@ -6,8 +6,8 @@ __all__ = [
     "normalize_quat","quats_to_R_batch","yaw_from_R","apply_yaw_align",
     "world_vec","estimate_fs","moving_avg","slerp","resample_quat","resample_vec",
     "gyro_from_quat",
-    # JCS-inspired angle helpers
-    "jcs_hip_angles","jcs_knee_angles",
+    # Angle helpers
+    "hip_angles_xyz","knee_angles_xyz","jcs_hip_angles","jcs_knee_angles",
     # Resampling utility
     "SideResampled","resample_side_to_femur_time",
 ]
@@ -195,83 +195,59 @@ def _signed_angle(a: np.ndarray, b: np.ndarray, axis: np.ndarray, eps: float = 1
     s = np.sign(np.sum(cross * _normalize(axis), axis=-1))
     return ang * s
 
-def jcs_hip_angles(R_pelvis: np.ndarray, R_femur: np.ndarray, side: str = 'L') -> np.ndarray:
-    """Compute hip angles (flexion, adduction, internal rotation) in radians using a
-    Grood–Suntay-inspired Joint Coordinate System.
+def _euler_xyz_from_relative(R_rel: np.ndarray) -> np.ndarray:
+    """Convert relative rotation matrices to intrinsic XYZ Euler angles.
 
-    Inputs are world-to-segment rotation matrices for pelvis and femur, shape (T,3,3).
-    side: 'L' or 'R' adjusts the pelvis ML axis so adduction is positive toward midline.
-
-    Returns array (T,3) in radians: [flex, add, rot].
+    Returns angles (T,3): [alpha_x, beta_y, gamma_z] in radians.
+    Uses SciPy for numerical stability and gimbal lock handling.
     """
-    R_p = np.asarray(R_pelvis, dtype=float)
-    R_f = np.asarray(R_femur, dtype=float)
-    Tn = R_p.shape[0]
-    if Tn == 0:
-        return np.zeros((0,3), dtype=float)
-    # Pelvis anatomical axes in world
-    x_p = R_p[:, :, 0]  # forward
-    y_p = R_p[:, :, 1]  # left
-    z_p = R_p[:, :, 2]  # up
-    # Adjust ML axis for right so that adduction positive is toward midline
-    i_ml = y_p if (str(side).upper() == 'L') else -y_p
-    # Femur long axis (approx): segment z-axis
-    k_f = R_f[:, :, 2]
-    k_f = _normalize(k_f)
-    i_ml = _normalize(i_ml)
-    # Floating axis j = k_f x i_ml
-    j_float = _normalize(np.cross(k_f, i_ml))
-    # Flexion: rotate about floating axis; measure in sagittal plane of pelvis
-    # Compute projection of femur long axis onto plane orthogonal to i_ml
-    k_perp = _normalize(_proj_on_plane(k_f, i_ml))
-    # Reference in that plane: pelvis z axis projected into same plane
-    z_perp = _normalize(_proj_on_plane(z_p, i_ml))
-    # Positive flexion when k_perp rotates toward pelvis x (forward)
-    flex = _signed_angle(z_perp, k_perp, i_ml)
-    # Adduction: angle between femur long axis and pelvis sagittal plane; sign via i_ml
-    # Using asin of component along i_ml bounded to [-pi/2,pi/2]
-    add = np.arcsin(np.clip(np.sum(k_f * i_ml, axis=-1), -1.0, 1.0))
-    # Internal rotation about femur long axis k_f: compare projected pelvis x axes
-    x_perp = _normalize(_proj_on_plane(x_p, k_f))
-    # Femur transverse reference: femur x-axis projected on plane normal k_f
-    x_f = R_f[:, :, 0]
-    xf_perp = _normalize(_proj_on_plane(x_f, k_f))
-    rot = _signed_angle(x_perp, xf_perp, k_f)
-    return np.stack([flex, add, rot], axis=1)
+    from scipy.spatial.transform import Rotation as _Rot
+    Rr = np.asarray(R_rel, dtype=float)
+    if Rr.ndim == 2:
+        Rr = Rr[None, ...]
+    # Clip minor numeric drift to keep valid rotation matrices
+    # SciPy handles batch conversion.
+    rot = _Rot.from_matrix(Rr)
+    return rot.as_euler('xyz', degrees=False)
 
-def jcs_knee_angles(R_femur: np.ndarray, R_tibia: np.ndarray, side: str = 'L') -> np.ndarray:
-    """Compute knee angles (flexion, adduction(varus negative), internal rotation) in radians
-    using a Grood–Suntay-inspired JCS.
+def hip_angles_xyz(R_pelvis: np.ndarray, R_femur: np.ndarray, side: str = 'L') -> np.ndarray:
+    """Hip angles via intrinsic XYZ Euler sequence.
 
-    Inputs are world-to-segment rotation matrices for femur and tibia, shape (T,3,3).
-    side: 'L' or 'R' adjusts the femur ML axis so adduction is positive toward midline for each limb.
-    Returns array (T,3) in radians: [flex, add, rot].
+    Conventions (ISB style): X=forward, Y=left, Z=long/up. Output order:
+    [flexion (about +X), adduction (about +Y), internal rotation (about +Z)].
+    For side='R', Y-angle is sign-flipped so adduction is positive toward midline
+    for both limbs.
     """
-    R_f = np.asarray(R_femur, dtype=float)
-    R_t = np.asarray(R_tibia, dtype=float)
-    Tn = R_f.shape[0]
-    if Tn == 0:
+    Rp = np.asarray(R_pelvis, dtype=float)
+    Rf = np.asarray(R_femur, dtype=float)
+    if Rp.size == 0 or Rf.size == 0:
         return np.zeros((0,3), dtype=float)
-    # Femur axes
-    x_f = R_f[:, :, 0]  # AP (approx flexion axis reference)
-    y_f = R_f[:, :, 1]  # ML (left)
-    z_f = R_f[:, :, 2]  # long axis (prox-dist)
-    # Adjust ML axis as above so that adduction positive moves toward midline
-    i_ml = y_f if (str(side).upper() == 'L') else -y_f
-    # Tibia long axis
-    k_t = _normalize(R_t[:, :, 2])
-    i_ml = _normalize(i_ml)
-    # Floating axis
-    j_float = _normalize(np.cross(k_t, i_ml))
-    # Flexion: projection of tibia long axis onto plane orthogonal to i_ml, vs femur z axis projected
-    kt_perp = _normalize(_proj_on_plane(k_t, i_ml))
-    zf_perp = _normalize(_proj_on_plane(z_f, i_ml))
-    flex = _signed_angle(zf_perp, kt_perp, i_ml)
-    # Adduction (varus/valgus): component along i_ml
-    add = np.arcsin(np.clip(np.sum(k_t * i_ml, axis=-1), -1.0, 1.0))
-    # Internal rotation about tibia long axis: compare projected femur x-axis and tibia x-axis
-    x_t = R_t[:, :, 0]
-    xf_perp = _normalize(_proj_on_plane(x_f, k_t))
-    xt_perp = _normalize(_proj_on_plane(x_t, k_t))
-    rot = _signed_angle(xf_perp, xt_perp, k_t)
-    return np.stack([flex, add, rot], axis=1)
+    # Relative pelvis->femur
+    R_rel = np.einsum('tij,tjk->tik', np.transpose(Rp, (0,2,1)), Rf)
+    e = _euler_xyz_from_relative(R_rel)
+    # Unify adduction sign across limbs
+    if str(side).upper() == 'R':
+        e[:,1] *= -1.0
+    return e
+
+def knee_angles_xyz(R_femur: np.ndarray, R_tibia: np.ndarray, side: str = 'L') -> np.ndarray:
+    """Knee angles via intrinsic XYZ Euler sequence.
+
+    Conventions as hip: X=flexion, Y=adduction (varus/valgus), Z=internal rotation.
+    Returns angles (T,3) in radians. For side='R', Y-angle is sign-flipped so
+    adduction is positive toward midline for both limbs.
+    """
+    Rf = np.asarray(R_femur, dtype=float)
+    Rt = np.asarray(R_tibia, dtype=float)
+    if Rf.size == 0 or Rt.size == 0:
+        return np.zeros((0,3), dtype=float)
+    # Relative femur->tibia
+    R_rel = np.einsum('tij,tjk->tik', np.transpose(Rf, (0,2,1)), Rt)
+    e = _euler_xyz_from_relative(R_rel)
+    if str(side).upper() == 'R':
+        e[:,1] *= -1.0
+    return e
+
+# Back-compatible aliases
+jcs_hip_angles = hip_angles_xyz
+jcs_knee_angles = knee_angles_xyz
