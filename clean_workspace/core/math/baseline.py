@@ -32,13 +32,13 @@ class BaselineConfig:
     def __init__(
         self,
         fs_hz: float,
-    use_yaw_share: bool = True,
+        use_yaw_share: bool = True,
         yaw_share_fc_hz: float = 0.05,  # 0.03–0.05 Hz typical
         stride_debias_axes: tuple[str, ...] = ("Y", "Z"),
-    highpass_fc_hz: float | None = None,  # OFF by default unless set
-    min_stride_samples: int = 30,
-    allow_stack: bool = False,
-    rewrap_after: bool = True,
+        highpass_fc_hz: float | None = None,  # OFF by default unless set
+        min_stride_samples: int = 30,
+        allow_stack: bool = False,
+        rewrap_after: bool = True,
     ):
         self.fs_hz = float(fs_hz)
         self.use_yaw_share = bool(use_yaw_share)
@@ -185,7 +185,9 @@ def stridewise_debias(
         grid = np.arange(T, dtype=float)
         off = np.zeros((T, len(axes_idx)), dtype=float)
         for j in range(len(axes_idx)):
-            off[:, j] = np.interp(grid, centers_arr, M[:, j], left=M[0, j], right=M[-1, j])
+            off[:, j] = np.interp(
+                grid, centers_arr, M[:, j], left=M[0, j], right=M[-1, j]
+            )
         # Subtract across whole series on selected axes
         for k, ax in enumerate(axes_idx):
             out[:, ax] -= off[:, k]
@@ -219,14 +221,14 @@ def apply_baseline_correction(
     mode: str | None = None,
 ) -> np.ndarray:
     """
-        Fail-safe pipeline:
-            unwrap → (optional) yaw-share OR stride-debias (based on cfg.allow_stack) → (optional) HP → (optional) rewrap
+    Fail-safe pipeline:
+        unwrap → (optional) yaw-share OR stride-debias (based on cfg.allow_stack) → (optional) HP → (optional) rewrap
 
-        - If cfg.use_yaw_share and yaws provided, prefer yaw-share. If allow_stack=False,
-            skip stride-debias to avoid double DC adjustments. If True, both can run.
-        - High-pass is OFF unless cfg.highpass_fc_hz is set to a positive value.
-            - If cfg.rewrap_after=True, wrap to (-pi, pi] for safe plotting/CSV.
-                Default is False to preserve continuity for downstream processing/tests.
+    - If cfg.use_yaw_share and yaws provided, prefer yaw-share. If allow_stack=False,
+        skip stride-debias to avoid double DC adjustments. If True, both can run.
+    - High-pass is OFF unless cfg.highpass_fc_hz is set to a positive value.
+        - If cfg.rewrap_after=True, wrap to (-pi, pi] for safe plotting/CSV.
+            Default is False to preserve continuity for downstream processing/tests.
     """
     A = np.asarray(euler_xyz, dtype=float)
     if A.ndim != 2 or A.shape[1] < 1:
@@ -242,9 +244,11 @@ def apply_baseline_correction(
         # Guardrails: don't accidentally stack and don't sneak HP unless requested
         assert not cfg.allow_stack, "allow_stack must be False for isolation tests"
         if mode_l != "highpass_only":
-            assert cfg.highpass_fc_hz in (None, 0, 0.0), (
-                "cfg.highpass_fc_hz must be None/0 when not testing highpass_only"
-            )
+            assert cfg.highpass_fc_hz in (
+                None,
+                0,
+                0.0,
+            ), "cfg.highpass_fc_hz must be None/0 when not testing highpass_only"
 
         Au = unwrap_cols(A)
 
@@ -268,7 +272,9 @@ def apply_baseline_correction(
             # Simulate effect on axial (Z) via change in relative yaw trend
             out = Au.copy()
             if yaw_pelvis is not None and yaw_femur is not None:
-                yp, yf = np.asarray(yaw_pelvis, dtype=float), np.asarray(yaw_femur, dtype=float)
+                yp, yf = np.asarray(yaw_pelvis, dtype=float), np.asarray(
+                    yaw_femur, dtype=float
+                )
                 yp_c, yf_c = yaw_share_timevarying(yp, yf, cfg)
                 # delta of relative yaw (femur - pelvis)
                 d_rel = (yf_c - yp_c) - (yf - yp)

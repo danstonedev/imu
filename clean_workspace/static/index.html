@@ -19,6 +19,18 @@
                 <input type="number" id="mass" name="mass_kg" step="0.1" value="100" required>
             </div>
             <div class="form-group">
+                <label for="angles-baseline-select">Angles baseline:</label>
+                <select id="angles-baseline-select" title="Baseline method for joint angles">
+                    <option value="auto" selected>Auto (default)</option>
+                    <option value="yaw_share">Yaw-share (hips)</option>
+                    <option value="stride_debias">Stride debias (YZ)</option>
+                </select>
+                <label for="angles-standing-neutral">Standing neutral:</label>
+                <input type="checkbox" id="angles-standing-neutral" checked title="Remove standing bias at matrix level using first still window (per joint)">
+                <label for="angles-highpass">HP cutoff (Hz):</label>
+                <input type="number" id="angles-highpass" step="0.001" placeholder="off" title="Optional high-pass cutoff for angles (display-grade). Leave blank for off.">
+            </div>
+            <div class="form-group">
                 <label for="data-input">Choose data (CSV files, a folder, or a ZIP):</label>
                 <input type="file" id="data-input" accept=".csv,.zip" multiple webkitdirectory>
                 <small class="hint">Pick one: (a) a single ZIP with multiple tests, (b) a folder containing test subfolders, or (c) the 5 CSVs. Leave blank to use sample data.</small>
@@ -168,6 +180,6 @@
         </div>
     </div>
     <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
-    <script src="/static/js/main.js?v=7"></script>
+    <script src="/static/js/main.js?v=9"></script>
 </body>
 </html>

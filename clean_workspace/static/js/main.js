@@ -9,6 +9,13 @@ document.getElementById('upload-form').addEventListener('submit', async function
     // Ensure baseline_mode is sent even for uploads
     const baselineSel = document.getElementById('baseline-mode');
     formData.append('baseline_mode', baselineSel?.value || 'linear');
+    // Angles baseline controls
+    const angBaseSel = document.getElementById('angles-baseline-select');
+    if (angBaseSel && angBaseSel.value) formData.append('angles_baseline_select', angBaseSel.value);
+    const angStand = document.getElementById('angles-standing-neutral');
+    if (angStand && angStand.checked) formData.append('angles_standing_neutral', 'true');
+    const angHp = document.getElementById('angles-highpass');
+    if (angHp && angHp.value) formData.append('angles_highpass_fc', angHp.value);
 
     // Unified input: accepts .csv, .zip, or a folder
     const dataInput = document.getElementById('data-input');
@@ -98,28 +105,42 @@ function displayResults(results) {
     // Tabs
     setupTabs();
 
-    // Downloads
+    // Downloads: enable only when content exists; otherwise disable link to avoid downloading page HTML
+    const setCsvHref = (a, csv) => {
+        if (!a) return;
+        if (typeof csv === 'string' && csv.length > 0) {
+            a.href = 'data:text/csv;charset=utf-8,' + encodeURIComponent(csv);
+            a.removeAttribute('aria-disabled');
+            a.classList.remove('disabled');
+            a.title = '';
+        } else {
+            a.removeAttribute('href');
+            a.setAttribute('aria-disabled', 'true');
+            a.classList.add('disabled');
+            a.title = 'Run analysis first to enable this download';
+        }
+    };
     const leftCsvLink = document.getElementById('left-csv-link');
     const rightCsvLink = document.getElementById('right-csv-link');
-    leftCsvLink.href = 'data:text/csv;charset=utf-8,' + encodeURIComponent(results.left_csv);
-    rightCsvLink.href = 'data:text/csv;charset=utf-8,' + encodeURIComponent(results.right_csv);
+    setCsvHref(leftCsvLink, results.left_csv);
+    setCsvHref(rightCsvLink, results.right_csv);
     const leftCycleCsvLink = document.getElementById('left-cycle-csv-link');
     const rightCycleCsvLink = document.getElementById('right-cycle-csv-link');
-    if (results.left_cycle_csv) leftCycleCsvLink.href = 'data:text/csv;charset=utf-8,' + encodeURIComponent(results.left_cycle_csv);
-    if (results.right_cycle_csv) rightCycleCsvLink.href = 'data:text/csv;charset=utf-8,' + encodeURIComponent(results.right_cycle_csv);
+    setCsvHref(leftCycleCsvLink, results.left_cycle_csv);
+    setCsvHref(rightCycleCsvLink, results.right_cycle_csv);
     // Angle CSV downloads
     const leftAnglesCsv = document.getElementById('left-angles-csv-link');
     const rightAnglesCsv = document.getElementById('right-angles-csv-link');
-    if (leftAnglesCsv && results.left_angles_csv) leftAnglesCsv.href = 'data:text/csv;charset=utf-8,' + encodeURIComponent(results.left_angles_csv);
-    if (rightAnglesCsv && results.right_angles_csv) rightAnglesCsv.href = 'data:text/csv;charset=utf-8,' + encodeURIComponent(results.right_angles_csv);
+    setCsvHref(leftAnglesCsv, results.left_angles_csv);
+    setCsvHref(rightAnglesCsv, results.right_angles_csv);
     const lHipCyc = document.getElementById('left-hip-cycle-angles-csv-link');
     const rHipCyc = document.getElementById('right-hip-cycle-angles-csv-link');
     const lKneeCyc = document.getElementById('left-knee-cycle-angles-csv-link');
     const rKneeCyc = document.getElementById('right-knee-cycle-angles-csv-link');
-    if (lHipCyc && results.left_hip_cycle_csv) lHipCyc.href = 'data:text/csv;charset=utf-8,' + encodeURIComponent(results.left_hip_cycle_csv);
-    if (rHipCyc && results.right_hip_cycle_csv) rHipCyc.href = 'data:text/csv;charset=utf-8,' + encodeURIComponent(results.right_hip_cycle_csv);
-    if (lKneeCyc && results.left_knee_cycle_csv) lKneeCyc.href = 'data:text/csv;charset=utf-8,' + encodeURIComponent(results.left_knee_cycle_csv);
-    if (rKneeCyc && results.right_knee_cycle_csv) rKneeCyc.href = 'data:text/csv;charset=utf-8,' + encodeURIComponent(results.right_knee_cycle_csv);
+    setCsvHref(lHipCyc, results.left_hip_cycle_csv);
+    setCsvHref(rHipCyc, results.right_hip_cycle_csv);
+    setCsvHref(lKneeCyc, results.left_knee_cycle_csv);
+    setCsvHref(rKneeCyc, results.right_knee_cycle_csv);
 
     // Time series charts (Mx/My/Mz/|M| with stance shading)
     renderTimeCharts(results);
@@ -300,11 +321,21 @@ function renderTimeCharts(results) {
     svg.on('mousemove', (ev)=> onMove(ev, null));
     svg.on('mouseleave', onLeave);
 
-    // Stance shading (as small markers at y baseline to mimic prior)
+    // Stance shading (small markers at baseline) with guards to avoid NaN x positions
     const drawStance = (times, stance, color) => {
+        const tArr = Array.isArray(times) ? times : [];
+        const sArr = Array.isArray(stance) ? stance : [];
+        const n = Math.min(tArr.length, sArr.length);
+        if (!n) return;
         const points = [];
-        for (let i=0;i<stance.length;i++) if (stance[i]) points.push(times[i]);
-    gData.selectAll(null)
+        for (let i = 0; i < n; i++) {
+            if (!sArr[i]) continue;
+            const tv = Number(tArr[i]);
+            if (Number.isFinite(tv)) points.push(tv);
+        }
+        if (!points.length) return;
+        // Use selectAll(null) so each call appends its own markers (L/R) without rebinding the other
+        gData.selectAll(null)
             .data(points)
             .join('rect')
             .attr('class','stance-mark')
@@ -361,7 +392,9 @@ function renderTimeCharts(results) {
         .scaleExtent([1, 40])
         .translateExtent([[0,0],[innerW, innerH]])
         .extent([[0,0],[innerW, innerH]])
-        .on('zoom', (ev) => rescale(ev.transform));
+        .on('zoom', (ev) => rescale(ev.transform))
+        // Disable touch-based zoom/pan to avoid non-passive touch warnings; mouse wheel/drag still work
+        .touchable(false);
     svg.call(zoom);
     document.getElementById('reset-zoom').onclick = () => {
         svg.transition().duration(200).call(zoom.transform, d3.zoomIdentity);
@@ -830,6 +863,9 @@ function renderMetrics(results) {
 
     // Baseline and toe-off
     const baseline = results?.meta?.baseline_mode || 'linear';
+    const angBaseSrc = results?.meta?.angles_baseline_source || null;
+    const angBaseTxt = angBaseSrc ? `hip=${String(angBaseSrc.hip||'')}, knee=${String(angBaseSrc.knee||'')}` : 'N/A';
+    const snApplied = !!(results?.meta?.angles_calibration?.standing_neutral?.applied);
     const toL = results?.cycles_compare?.anchor_L?.meta?.to_percent;
     const toR = results?.cycles_compare?.anchor_R?.meta?.to_percent;
     const bL0 = results?.baseline_JCS?.L?.start || null;
@@ -852,6 +888,8 @@ function renderMetrics(results) {
                 <tr><td>Toe-off % (Right-ref)</td><td>${fmtPct(toR)}</td></tr>
                 <tr><td>Normalized Signs</td><td>time=on (locked), cycles=on (locked)</td></tr>
                 <tr><td>Calibration Windows</td><td>${cwCount} (total ${fmt(cwDur,2)} s)</td></tr>
+                <tr><td>Angles baseline</td><td>${angBaseTxt}</td></tr>
+                <tr><td>Standing neutral</td><td>${snApplied ? 'applied' : 'off'}</td></tr>
             </tbody>
         </table>
     `;
@@ -1057,10 +1095,20 @@ function renderAnglesTimeCharts(results) {
     svg.append('text').attr('x', margin.left + innerW/2).attr('y', height-5).attr('text-anchor','middle').text('Time (s)');
     svg.append('text').attr('transform',`translate(12,${margin.top+innerH/2}) rotate(-90)`).attr('text-anchor','middle').text('Angle (deg)');
 
-    // Stance marks
+    // Stance marks with guards to avoid NaN x positions
     const drawStance = (times, stance, color) => {
+        const tArr = Array.isArray(times) ? times : [];
+        const sArr = Array.isArray(stance) ? stance : [];
+        const n = Math.min(tArr.length, sArr.length);
+        if (!n) return;
         const points = [];
-        for (let i=0;i<stance.length;i++) if (stance[i]) points.push(times[i]);
+        for (let i = 0; i < n; i++) {
+            if (!sArr[i]) continue;
+            const tv = Number(tArr[i]);
+            if (Number.isFinite(tv)) points.push(tv);
+        }
+        if (!points.length) return;
+        // Use selectAll(null) so each call appends its own markers (L/R) without rebinding the other
         gData.selectAll(null)
             .data(points)
             .join('rect')
@@ -1138,7 +1186,13 @@ function renderAnglesTimeCharts(results) {
         svg.on('mousemove', (ev)=> onMove(ev, zx));
         svg.on('mouseleave', onLeave);
     };
-    const zoom = d3.zoom().scaleExtent([1, 40]).translateExtent([[0,0],[innerW, innerH]]).extent([[0,0],[innerW, innerH]]).on('zoom', (ev)=> rescale(ev.transform));
+    const zoom = d3.zoom()
+        .scaleExtent([1, 40])
+        .translateExtent([[0,0],[innerW, innerH]])
+        .extent([[0,0],[innerW, innerH]])
+        .on('zoom', (ev)=> rescale(ev.transform))
+        // Disable touch-based zoom/pan to avoid non-passive touch warnings; mouse interactions remain
+        .touchable(false);
     svg.call(zoom);
     const resetBtn = document.getElementById('reset-angles-zoom');
     if (resetBtn) resetBtn.onclick = () => svg.transition().duration(200).call(zoom.transform, d3.zoomIdentity);
@@ -1249,6 +1303,12 @@ document.getElementById('run-sample').addEventListener('click', async function()
     fd.append('mass_kg', m);
     const baseline = document.getElementById('baseline-mode')?.value || 'linear';
     fd.append('baseline_mode', baseline);
+    const angBaseSel = document.getElementById('angles-baseline-select');
+    if (angBaseSel && angBaseSel.value) fd.append('angles_baseline_select', angBaseSel.value);
+    const angStand2 = document.getElementById('angles-standing-neutral');
+    if (angStand2 && angStand2.checked) fd.append('angles_standing_neutral', 'true');
+    const angHp = document.getElementById('angles-highpass');
+    if (angHp && angHp.value) fd.append('angles_highpass_fc', angHp.value);
 
     const loadingDiv = document.getElementById('loading');
     const resultsDiv = document.getElementById('results');

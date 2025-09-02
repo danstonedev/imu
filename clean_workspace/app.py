@@ -55,6 +55,16 @@ async def analyze_data(
     mass_kg: float = Form(...),
     baseline_mode: Optional[str] = Form(None),
     cal_mode: Optional[str] = Form(None),
+    # New: angles baseline options for joint angles pipeline
+    angles_baseline_select: Optional[str] = Form(
+        None
+    ),  # 'auto' | 'yaw_share' | 'stride_debias'
+    angles_highpass_fc: Optional[float] = Form(
+        None
+    ),  # e.g., 0.03 (Hz); None or 0 -> off
+    angles_standing_neutral: Optional[bool] = Form(
+        False
+    ),  # matrix-level standing-neutral per joint
     # New: accept a single .zip containing multiple tests (nested folders ok)
     archive: Optional[UploadFile] = File(None),
     # New: support bulk upload of files (multiple or a selected folder)
@@ -291,6 +301,7 @@ async def analyze_data(
             "do_cal": True,
             "yaw_align": True,
             "yaw_share": {"enabled": False},
+            "angles_standing_neutral": True,
         }
         if isinstance(baseline_mode, str) and baseline_mode in {
             "none",
@@ -300,6 +311,22 @@ async def analyze_data(
             options["baseline_mode"] = baseline_mode
         if isinstance(cal_mode, str) and cal_mode in {"simple", "advanced"}:
             options["cal_mode"] = cal_mode
+        # Pass through angles baseline controls when provided
+        if isinstance(angles_baseline_select, str) and angles_baseline_select in {
+            "auto",
+            "yaw_share",
+            "stride_debias",
+        }:
+            options["angles_baseline_select"] = angles_baseline_select
+        if (
+            isinstance(angles_highpass_fc, (int, float))
+            and float(angles_highpass_fc) > 0
+        ):
+            options["angles_highpass_fc"] = float(angles_highpass_fc)
+        if isinstance(angles_standing_neutral, (bool,)) and bool(
+            angles_standing_neutral
+        ):
+            options["angles_standing_neutral"] = True
         for key, mapping in ds:
             files_bytes = {
                 role: (await mapping[role].read())
@@ -334,6 +361,7 @@ async def analyze_data(
                 "do_cal": True,
                 "yaw_align": True,
                 "yaw_share": {"enabled": False},
+                "angles_standing_neutral": True,
             }
             if isinstance(baseline_mode, str) and baseline_mode in {
                 "none",
@@ -343,6 +371,22 @@ async def analyze_data(
                 options["baseline_mode"] = baseline_mode
             if isinstance(cal_mode, str) and cal_mode in {"simple", "advanced"}:
                 options["cal_mode"] = cal_mode
+            # Pass through angles baseline controls when provided
+            if isinstance(angles_baseline_select, str) and angles_baseline_select in {
+                "auto",
+                "yaw_share",
+                "stride_debias",
+            }:
+                options["angles_baseline_select"] = angles_baseline_select
+            if (
+                isinstance(angles_highpass_fc, (int, float))
+                and float(angles_highpass_fc) > 0
+            ):
+                options["angles_highpass_fc"] = float(angles_highpass_fc)
+            if isinstance(angles_standing_neutral, (bool,)) and bool(
+                angles_standing_neutral
+            ):
+                options["angles_standing_neutral"] = True
             for key, mapping in datasets:
                 files_bytes = {
                     role: (await mapping[role].read())
@@ -421,7 +465,12 @@ async def analyze_data(
         }
         files_bytes = {k: Path(v).read_bytes() for k, v in sample_paths.items()}
 
-    options: dict = {"do_cal": True, "yaw_align": True, "yaw_share": {"enabled": False}}
+    options: dict = {
+        "do_cal": True,
+        "yaw_align": True,
+        "yaw_share": {"enabled": False},
+        "angles_standing_neutral": True,
+    }
     if isinstance(baseline_mode, str) and baseline_mode in {
         "none",
         "constant",
@@ -430,6 +479,17 @@ async def analyze_data(
         options["baseline_mode"] = baseline_mode
     if isinstance(cal_mode, str) and cal_mode in {"simple", "advanced"}:
         options["cal_mode"] = cal_mode
+    # Pass through angles baseline controls when provided
+    if isinstance(angles_baseline_select, str) and angles_baseline_select in {
+        "auto",
+        "yaw_share",
+        "stride_debias",
+    }:
+        options["angles_baseline_select"] = angles_baseline_select
+    if isinstance(angles_highpass_fc, (int, float)) and float(angles_highpass_fc) > 0:
+        options["angles_highpass_fc"] = float(angles_highpass_fc)
+    if isinstance(angles_standing_neutral, (bool,)) and bool(angles_standing_neutral):
+        options["angles_standing_neutral"] = True
     results = run_pipeline_clean(files_bytes, height_m, mass_kg, options)
     # Attach simple meta for UI
     try:
