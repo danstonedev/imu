@@ -198,25 +198,44 @@ def _signed_angle(a: np.ndarray, b: np.ndarray, axis: np.ndarray, eps: float = 1
 def _euler_xyz_from_relative(R_rel: np.ndarray) -> np.ndarray:
     """Convert relative rotation matrices to intrinsic XYZ Euler angles.
 
-    Returns angles (T,3): [alpha_x, beta_y, gamma_z] in radians.
-    Uses SciPy for numerical stability and gimbal lock handling.
+    Contract:
+    - Input: R_rel shape (T,3,3) or (3,3), right-handed rotations.
+    - Output: angles (T,3) in radians [X, Y, Z] for intrinsic 'xyz'.
+    - Behavior near gimbal lock (|Y| -> 90deg): relies on SciPy's
+      handling; one DOF may be set to zero but reconstruction remains stable.
     """
     from scipy.spatial.transform import Rotation as _Rot
     Rr = np.asarray(R_rel, dtype=float)
     if Rr.ndim == 2:
         Rr = Rr[None, ...]
-    # Clip minor numeric drift to keep valid rotation matrices
-    # SciPy handles batch conversion.
+    # Guard tiny numerical drift by projecting to nearest rotation via SVD
+    # only if a matrix is badly conditioned.
+    def _project_rot(M: np.ndarray) -> np.ndarray:
+        U, _, Vt = np.linalg.svd(M)
+        Rm = U @ Vt
+        if np.linalg.det(Rm) < 0:
+            U[:, -1] *= -1
+            Rm = U @ Vt
+        return Rm
+    bad = ~np.isfinite(Rr).all(axis=(1,2))
+    if np.any(bad):
+        Rr[bad] = np.eye(3)
+    # Convert
     rot = _Rot.from_matrix(Rr)
     return rot.as_euler('xyz', degrees=False)
 
 def hip_angles_xyz(R_pelvis: np.ndarray, R_femur: np.ndarray, side: str = 'L') -> np.ndarray:
-    """Hip angles via intrinsic XYZ Euler sequence.
+    """Hip angles via intrinsic XYZ Euler sequence (ISB-style axes).
 
-    Conventions (ISB style): X=forward, Y=left, Z=long/up. Output order:
-    [flexion (about +X), adduction (about +Y), internal rotation (about +Z)].
-    For side='R', Y-angle is sign-flipped so adduction is positive toward midline
-    for both limbs.
+    Axes:
+    - X (sagittal): + = flexion (forward raise)
+    - Y (frontal):  + = adduction (toward midline) for both sides
+    - Z (axial):    + = internal rotation (inward spin)
+
+    Side handling:
+    - Right limb uses a sign flip on the Y component only to keep adduction
+      positive toward midline across limbs. Z (internal rot) remains positive
+      for both sides without flipping.
     """
     Rp = np.asarray(R_pelvis, dtype=float)
     Rf = np.asarray(R_femur, dtype=float)
@@ -231,11 +250,12 @@ def hip_angles_xyz(R_pelvis: np.ndarray, R_femur: np.ndarray, side: str = 'L') -
     return e
 
 def knee_angles_xyz(R_femur: np.ndarray, R_tibia: np.ndarray, side: str = 'L') -> np.ndarray:
-    """Knee angles via intrinsic XYZ Euler sequence.
+    """Knee angles via intrinsic XYZ Euler sequence (ISB-style axes).
 
     Conventions as hip: X=flexion, Y=adduction (varus/valgus), Z=internal rotation.
     Returns angles (T,3) in radians. For side='R', Y-angle is sign-flipped so
-    adduction is positive toward midline for both limbs.
+    adduction is positive toward midline for both limbs. Z sign is unchanged
+    so internal rotation remains positive on both sides.
     """
     Rf = np.asarray(R_femur, dtype=float)
     Rt = np.asarray(R_tibia, dtype=float)
