@@ -398,6 +398,7 @@ def run_pipeline_clean(
     RLt_ang = _apply_level(RLt, R0L)
     RP_R_ang = _apply_level(RP_R, R0R)
     RRf_ang = _apply_level(RRf, R0R)
+    RRt_ang = _apply_level(RRt, R0R)
 
     # Optional: time-varying yaw sharing to reduce drift (common-mode & relative)
     # Baseline selection for angles: 'yaw_share' | 'stride_debias' | 'auto' (default)
@@ -449,6 +450,9 @@ def run_pipeline_clean(
             if (pickL == "yaw_share" or pickR == "yaw_share")
             else "stride_debias"
         )
+
+    # Guard against over-stacking yaw corrections
+    use_pre_share = angles_baseline_select == "yaw_share"
 
     # Configure pre-Euler yaw share default based on selection
     yaw_share = (options.get("yaw_share") if isinstance(options, dict) else None) or {}
@@ -514,8 +518,6 @@ def run_pipeline_clean(
         RP_R_ang = np.einsum("tij,tjk->tik", RzP_R, RP_R_ang)
         RRf_ang = np.einsum("tij,tjk->tik", RzF_R, RRf_ang)
 
-    RRt_ang = _apply_level(RRt, R0R)
-
     # Optional: Standing-neutral per joint (matrix-level) using first still window
     angles_standing_neutral = (
         bool(options.get("angles_standing_neutral", True))
@@ -523,6 +525,44 @@ def run_pipeline_clean(
         else True
     )
     standing_neutral_meta: dict[str, Any] = {"applied": False}
+    
+    # Advanced mode: Optional angle-only pelvis yaw leveling to remove residual heading
+    # Do this BEFORE standing-neutral so "neutral" is defined in post-heading frame
+    if cal_mode == "advanced":
+        # Guard against over-stacking: skip if pre-Euler yaw-share is already active
+        if not bool(yaw_share.get("enabled", False)):
+            def _Rz_world(phi: float) -> np.ndarray:
+                c, s = float(np.cos(phi)), float(np.sin(phi))
+                return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]], dtype=float)
+
+            yawL = (
+                yaw_from_R(RP_L_ang) if isinstance(RP_L_ang, np.ndarray) else np.array([])
+            )
+            yawR = (
+                yaw_from_R(RP_R_ang) if isinstance(RP_R_ang, np.ndarray) else np.array([])
+            )
+            yaw_med_L = (
+                float(np.median(yawL[startMaskL]))
+                if (yawL.size and startMaskL.any())
+                else 0.0
+            )
+            yaw_med_R = (
+                float(np.median(yawR[startMaskR]))
+                if (yawR.size and startMaskR.any())
+                else 0.0
+            )
+
+            if np.isfinite(yaw_med_L) and abs(yaw_med_L) > 0:
+                RzL = _Rz_world(-yaw_med_L)
+                RP_L_ang = np.einsum("ij,tjk->tik", RzL, RP_L_ang)
+                RLf_ang = np.einsum("ij,tjk->tik", RzL, RLf_ang)
+                RLt_ang = np.einsum("ij,tjk->tik", RzL, RLt_ang)
+            if np.isfinite(yaw_med_R) and abs(yaw_med_R) > 0:
+                RzR = _Rz_world(-yaw_med_R)
+                RP_R_ang = np.einsum("ij,tjk->tik", RzR, RP_R_ang)
+                RRf_ang = np.einsum("ij,tjk->tik", RzR, RRf_ang)
+                RRt_ang = np.einsum("ij,tjk->tik", RzR, RRt_ang)
+    
     if angles_standing_neutral:
 
         def _mean_rot_safe(Rs: np.ndarray) -> np.ndarray:
@@ -702,38 +742,11 @@ def run_pipeline_clean(
         }
     else:
         # Advanced mode: angle-only yaw leveling + functional twist + static hip reference
-        # Optional: angle-only pelvis yaw leveling to remove residual heading for angles.
-        def _Rz_world(phi: float) -> np.ndarray:
-            c, s = float(np.cos(phi)), float(np.sin(phi))
-            return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]], dtype=float)
-
-        yawL = (
-            yaw_from_R(RP_L_ang) if isinstance(RP_L_ang, np.ndarray) else np.array([])
-        )
-        yawR = (
-            yaw_from_R(RP_R_ang) if isinstance(RP_R_ang, np.ndarray) else np.array([])
-        )
-        yaw_med_L = (
-            float(np.median(yawL[startMaskL]))
-            if (yawL.size and startMaskL.any())
-            else 0.0
-        )
-        yaw_med_R = (
-            float(np.median(yawR[startMaskR]))
-            if (yawR.size and startMaskR.any())
-            else 0.0
-        )
-
-        if np.isfinite(yaw_med_L) and abs(yaw_med_L) > 0:
-            RzL = _Rz_world(-yaw_med_L)
-            RP_L_ang = np.einsum("ij,tjk->tik", RzL, RP_L_ang)
-            RLf_ang = np.einsum("ij,tjk->tik", RzL, RLf_ang)
-            RLt_ang = np.einsum("ij,tjk->tik", RzL, RLt_ang)
-        if np.isfinite(yaw_med_R) and abs(yaw_med_R) > 0:
-            RzR = _Rz_world(-yaw_med_R)
-            RP_R_ang = np.einsum("ij,tjk->tik", RzR, RP_R_ang)
-            RRf_ang = np.einsum("ij,tjk->tik", RzR, RRf_ang)
-            RRt_ang = np.einsum("ij,tjk->tik", RzR, RRt_ang)
+        # Record baseline source for angles in advanced mode
+        angles_baseline_source = {
+            "hip": "yaw_share_or_stride_debias",
+            "knee": "yaw_share_or_stride_debias",
+        }
 
     # ---------------------------------------------
     # Functional twist calibration (advanced)
@@ -956,6 +969,140 @@ def run_pipeline_clean(
         if np.isfinite(phi_knee_R):
             RRt_ang = np.einsum("tij,jk->tik", RRt_ang, _Rz_local(-phi_knee_R))
             twist_meta["tibia_R_deg"] = float(np.degrees(phi_knee_R))
+
+        # ---------------------------------------------
+        # Full S2S alignment (tilt/roll + twist)
+        # ---------------------------------------------
+        # Apply functional plane alignment to each segment using angular velocity PCA
+        # This corrects for pitch/roll misalignment that leaks into adduction/rotation
+        def functional_plane_align(
+            R_series: np.ndarray, 
+            gyro_series: np.ndarray, 
+            still_mask: np.ndarray = None
+        ) -> np.ndarray:
+            """
+            Align segment frame using functional plane based on angular velocity PCA.
+            
+            The sagittal plane is found by taking the principal component of angular velocity
+            during active motion periods. The segment frame is then rotated so its sagittal
+            plane (x-z plane) aligns with the functional motion plane.
+            
+            Args:
+                R_series: (N, 3, 3) rotation matrices
+                gyro_series: (N, 3) angular velocity in segment frame
+                still_mask: (N,) boolean mask for stillness (optional)
+                
+            Returns:
+                (N, 3, 3) rotation matrices aligned to functional plane
+            """
+            if R_series is None or gyro_series is None:
+                return R_series
+                
+            if R_series.shape[0] != gyro_series.shape[0]:
+                return R_series
+                
+            # Select motion periods (not still)
+            if still_mask is not None and still_mask.size == gyro_series.shape[0]:
+                motion_mask = ~still_mask
+                if not motion_mask.any():
+                    # No motion detected, return original
+                    return R_series
+                gyro_motion = gyro_series[motion_mask]
+            else:
+                # Use periods of high angular velocity
+                gyro_mag = np.linalg.norm(gyro_series, axis=1)
+                threshold = np.percentile(gyro_mag, 75)  # Top 25% of motion
+                motion_mask = gyro_mag > threshold
+                if not motion_mask.any():
+                    return R_series
+                gyro_motion = gyro_series[motion_mask]
+            
+            # PCA on angular velocity during motion
+            try:
+                # Center the data
+                gyro_centered = gyro_motion - np.mean(gyro_motion, axis=0)
+                
+                # Compute covariance matrix
+                cov_matrix = np.cov(gyro_centered.T)
+                
+                # Eigendecomposition
+                eigenvals, eigenvecs = np.linalg.eigh(cov_matrix)
+                
+                # Sort by eigenvalue (descending)
+                idx = np.argsort(eigenvals)[::-1]
+                eigenvecs = eigenvecs[:, idx]
+                
+                # Primary axis (dominant motion direction)
+                primary_axis = eigenvecs[:, 0]
+                
+                # Secondary axis (orthogonal to primary)
+                secondary_axis = eigenvecs[:, 1]
+                
+                # Tertiary axis (minimal motion, likely sagittal normal)
+                tertiary_axis = eigenvecs[:, 2]
+                
+                # The functional sagittal plane normal is the direction with minimal motion
+                # For gait, this is typically the medio-lateral axis (y-axis)
+                sagittal_normal = tertiary_axis
+                
+                # Ensure right-handed coordinate system
+                if np.dot(np.cross(primary_axis, secondary_axis), tertiary_axis) < 0:
+                    tertiary_axis = -tertiary_axis
+                    sagittal_normal = -sagittal_normal
+                
+                # Build rotation matrix to align segment y-axis with sagittal normal
+                # Target: segment y should align with sagittal_normal
+                # Current y-axis in segment frame is [0, 1, 0]
+                current_y = np.array([0.0, 1.0, 0.0])
+                target_y = sagittal_normal / np.linalg.norm(sagittal_normal)
+                
+                # Compute rotation axis and angle
+                rotation_axis = np.cross(current_y, target_y)
+                rotation_axis_norm = np.linalg.norm(rotation_axis)
+                
+                if rotation_axis_norm < 1e-6:
+                    # Already aligned or opposite
+                    if np.dot(current_y, target_y) < 0:
+                        # 180-degree rotation needed - use x-axis
+                        rotation_axis = np.array([1.0, 0.0, 0.0])
+                        rotation_angle = np.pi
+                    else:
+                        # Already aligned
+                        return R_series
+                else:
+                    rotation_axis = rotation_axis / rotation_axis_norm
+                    rotation_angle = np.arcsin(np.clip(rotation_axis_norm, 0, 1))
+                    
+                    # Check for obtuse angle
+                    if np.dot(current_y, target_y) < 0:
+                        rotation_angle = np.pi - rotation_angle
+                
+                # Build rotation matrix using Rodrigues' formula
+                K = np.array([
+                    [0, -rotation_axis[2], rotation_axis[1]],
+                    [rotation_axis[2], 0, -rotation_axis[0]], 
+                    [-rotation_axis[1], rotation_axis[0], 0]
+                ])
+                
+                R_align = (np.eye(3) + 
+                          np.sin(rotation_angle) * K + 
+                          (1 - np.cos(rotation_angle)) * K @ K)
+                
+                # Apply alignment to all frames
+                R_aligned = np.einsum('tij,jk->tik', R_series, R_align)
+                
+                return R_aligned
+                
+            except Exception:
+                # If anything fails, return original
+                return R_series
+
+        # Apply functional plane alignment to femur and tibia segments
+        # Use the segment-specific stillness masks from twist calibration
+        RLf_ang = functional_plane_align(RLf_ang, gLf_res, femur_still_L_tw)
+        RRf_ang = functional_plane_align(RRf_ang, gRf_res, femur_still_R_tw)
+        RLt_ang = functional_plane_align(RLt_ang, gLt_res, tibia_still_L_tw)
+        RRt_ang = functional_plane_align(RRt_ang, gRt_res, tibia_still_R_tw)
 
         # Compute angles on leveled frames
         hipL_rad = jcs_hip_angles(RP_L_ang, RLf_ang, side="L")
@@ -1195,7 +1342,6 @@ def run_pipeline_clean(
     )
 
     # If we used pre-Euler yaw-share, do not also yaw-share or stride-debias hips in baseline
-    use_pre_share = angles_baseline_select == "yaw_share"
     cfgL.use_yaw_share = False
     cfgR.use_yaw_share = False
 

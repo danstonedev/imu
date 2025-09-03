@@ -14,7 +14,7 @@ def enforce_lr_conventions(M_L: np.ndarray, M_R: np.ndarray,
         - Angles (hip, knee): enforce a comparable L/R convention for plotting/averaging:
             • Flexion: positive for both sides → flip Right flex component only.
             • Adduction: already defined positive toward midline via JCS side handling → no flip.
-            • Internal rotation: positive for both sides → flip Right rotation component only.
+            • Internal rotation: already handled by JCS extractors → no additional flip needed.
 
     Inputs:
       M_L, M_R: (T,>=3) hip moments in JCS for Left and Right.
@@ -56,7 +56,7 @@ def enforce_lr_conventions(M_L: np.ndarray, M_R: np.ndarray,
             AR = _as_arr(outR.get(k))
             if isinstance(AR, np.ndarray) and AR.ndim == 2 and AR.shape[1] >= 3:
                 AR[:, 0] *= -1.0  # Right flex
-                AR[:, 2] *= -1.0  # Right rotation
+                # AR[:, 2] *= -1.0  # REMOVED: Right rotation already handled by JCS
                 outR[k] = AR
 
     return ML, MR, outL, outR
