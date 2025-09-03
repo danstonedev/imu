@@ -27,6 +27,8 @@ class BaselineConfig:
     - min_stride_samples: Minimum samples within a stride window to apply debias
     - allow_stack: If False, do not combine yaw-share with stride-debias (fail-safe)
     - rewrap_after: If True, wrap output angles to (-pi, pi] after correction
+    - use_calibration_windows: Whether to apply calibration window-based corrections
+    - calibration_axes: Axes to apply calibration window corrections (subset of {"X","Y","Z"})
     """
 
     def __init__(
@@ -39,6 +41,8 @@ class BaselineConfig:
         min_stride_samples: int = 30,
         allow_stack: bool = False,
         rewrap_after: bool = True,
+        use_calibration_windows: bool = True,
+        calibration_axes: tuple[str, ...] = ("X", "Y", "Z"),
     ):
         self.fs_hz = float(fs_hz)
         self.use_yaw_share = bool(use_yaw_share)
@@ -48,6 +52,8 @@ class BaselineConfig:
         self.min_stride_samples = int(min_stride_samples)
         self.allow_stack = bool(allow_stack)
         self.rewrap_after = bool(rewrap_after)
+        self.use_calibration_windows = bool(use_calibration_windows)
+        self.calibration_axes = tuple(str(a).upper() for a in calibration_axes)
 
 
 def unwrap_cols(A: np.ndarray) -> np.ndarray:
@@ -216,8 +222,10 @@ def apply_baseline_correction(
     # optional context for yaw-share if caller provides segment yaw traces
     yaw_pelvis: np.ndarray | None = None,
     yaw_femur: np.ndarray | None = None,
+    # calibration windows for window-based corrections
+    calibration_windows: list[tuple[float, float]] | None = None,
     # Diagnostic isolation mode: None = normal behavior using cfg;
-    # "none" | "yaw_share_only" | "stride_debias_only" | "highpass_only"
+    # "none" | "yaw_share_only" | "stride_debias_only" | "highpass_only" | "calibration_only"
     mode: str | None = None,
 ) -> np.ndarray:
     """
@@ -237,13 +245,13 @@ def apply_baseline_correction(
     # Diagnostic isolation branch
     if isinstance(mode, str):
         mode_l = mode.lower().strip()
-        valid = {"none", "yaw_share_only", "stride_debias_only", "highpass_only"}
+        valid = {"none", "yaw_share_only", "stride_debias_only", "highpass_only", "calibration_only"}
         if mode_l not in valid:
             raise ValueError(f"Invalid mode '{mode}'. Expected one of {sorted(valid)}")
 
         # Guardrails: don't accidentally stack and don't sneak HP unless requested
         assert not cfg.allow_stack, "allow_stack must be False for isolation tests"
-        if mode_l != "highpass_only":
+        if mode_l not in ("highpass_only", "calibration_only"):
             assert cfg.highpass_fc_hz in (
                 None,
                 0,
@@ -281,6 +289,14 @@ def apply_baseline_correction(
                 d_rel = d_rel[: out.shape[0]]
                 if out.shape[1] >= 3 and d_rel.size == out.shape[0]:
                     out[:, 2] = out[:, 2] + d_rel
+        elif mode_l == "calibration_only":
+            # Apply only calibration window-based corrections
+            out = Au.copy()
+            if calibration_windows and cfg.use_calibration_windows:
+                axes_idx = _axes_to_idx(cfg.calibration_axes)
+                out = apply_calibration_window_correction(
+                    t, out, calibration_windows, cfg.fs_hz, axes=axes_idx
+                )
         else:
             out = Au
 
@@ -295,6 +311,13 @@ def apply_baseline_correction(
     if cfg.use_yaw_share and yaw_pelvis is not None and yaw_femur is not None:
         _yp, _yf = yaw_share_timevarying(yaw_pelvis, yaw_femur, cfg)
         did_share = True
+
+    # Calibration window-based corrections for start/end periods
+    if calibration_windows and cfg.use_calibration_windows:
+        axes_idx = _axes_to_idx(cfg.calibration_axes)
+        Au = apply_calibration_window_correction(
+            t, Au, calibration_windows, cfg.fs_hz, axes=axes_idx
+        )
 
     # Stride-wise DC removal on selected axes (default Y,Z), unless stacking is disallowed
     if stride_indices and (cfg.allow_stack or not did_share):
@@ -314,3 +337,62 @@ def apply_baseline_correction(
     if cfg.rewrap_after:
         Au = wrap_pi(Au)
     return Au
+
+
+def apply_calibration_window_correction(
+    t: np.ndarray,
+    euler_xyz: np.ndarray,
+    calibration_windows: list[dict] | list[tuple[float, float]],
+    fs_hz: float,
+    axes: tuple[int, ...] = (0, 1, 2),
+) -> np.ndarray:
+    """
+    Apply calibration window-based corrections to Euler angles.
+    
+    Computes the mean offset across ALL calibration windows for each axis
+    and removes it from the entire signal.
+    
+    Parameters:
+    - t: Time array (seconds)
+    - euler_xyz: Euler angles array (T,3) 
+    - calibration_windows: List of calibration window dicts or (start_time, end_time) tuples
+    - fs_hz: Sampling frequency
+    - axes: Which axes to correct (0=X, 1=Y, 2=Z)
+    
+    Returns:
+    - Corrected Euler angles
+    """
+    A = np.asarray(euler_xyz, dtype=float)
+    if A.ndim != 2 or A.shape[1] < 1 or not calibration_windows:
+        return A.copy()
+    
+    A_corr = A.copy()
+    t_arr = np.asarray(t, dtype=float)
+    
+    # For each axis, collect data from all calibration windows and compute overall offset
+    for axis_idx in axes:
+        if axis_idx < A.shape[1]:
+            cal_data_all = []
+            
+            # Collect data from all calibration windows
+            for window in calibration_windows:
+                # Handle both dict format (from pipeline) and tuple format (from tests)
+                if isinstance(window, dict):
+                    start_time = window['start_s']
+                    end_time = window['end_s']
+                else:
+                    start_time, end_time = window
+                    
+                mask = (t_arr >= start_time) & (t_arr <= end_time)
+                if np.any(mask):
+                    cal_data = A_corr[mask, axis_idx]
+                    if len(cal_data) > 0:
+                        cal_data_all.extend(cal_data)
+            
+            # Compute overall offset from all calibration windows combined
+            if cal_data_all:
+                offset = np.nanmean(cal_data_all)
+                # Remove offset from entire signal
+                A_corr[:, axis_idx] -= offset
+                    
+    return A_corr

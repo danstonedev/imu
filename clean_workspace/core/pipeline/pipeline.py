@@ -1224,6 +1224,7 @@ def run_pipeline_clean(
             cfg,
             yaw_pelvis=(yaw_p if yaw_p is not None else None),
             yaw_femur=(yaw_f if yaw_f is not None else None),
+            calibration_windows=cal_windows,  # Pass detected calibration windows
             mode=mode,
         )
         return np.rad2deg(A_corr).astype(np.float32)
